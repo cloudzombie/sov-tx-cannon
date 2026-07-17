@@ -6,17 +6,24 @@
 
 //! SOV TX Cannon — an automated transaction traffic generator.
 //!
-//! Watches a SOV node's chain tip over JSON-RPC and, on each NEW block, fires a
-//! configurable number of transparent transfers from a wallet the user unlocks
-//! (SOV-Station's own encrypted keystore) to destination addresses the user sets.
+//! Fires transparent transfers from wallets the user unlocks (SOV-Station's own
+//! encrypted keystore) to destination addresses the user sets, in one of three
+//! rate modes:
+//!   * **Per block** — on each NEW chain tip, fire N transactions (the original
+//!     behavior).
+//!   * **Target TX/s** — a steady paced rate decoupled from blocks.
+//!   * **Firehose** — submit as fast as sign+POST allows; the mempool's capacity
+//!     rejections are the only brake (the cannon holds and retries the same
+//!     nonce on those, self-pacing to the drain rate).
+//!
+//! Multiple wallets can fire in parallel (one worker per wallet, each with its
+//! own nonce sequencer and its own zeroizing seed copy), and a live meter panel
+//! shows attempted/accepted/rejected per second, a rejection breakdown, and the
+//! node's mempool depth with a saturation flag.
 //!
 //! This is PURELY functional traffic generation: it only READS chain state and
 //! SUBMITS already-signed transactions through the same key-free RPC surface any
 //! wallet uses. It touches no consensus, mining, block-encoding, or genesis code.
-//!
-//! Wallet identity: the keystore's `account` field is a DISPLAY LABEL. The real
-//! on-chain id is derived from the seed ([`logic::derive_account_id`]) exactly as
-//! the node does — that derived id is what balances, nonces, and the tx signer use.
 //!
 //! Security posture (see the worker docs, below): the master passphrase and every
 //! wallet signing seed live in `zeroize`-wiped buffers for the session only;
@@ -36,78 +43,85 @@ use sov_primitives::AccountId;
 use sov_rpc::{Keystore, RpcClient};
 
 use logic::{
-    build_signed_transfer, decode_keystore, grains_to_xus, merge_wallets, parse_xus, short_account,
-    AmountMode, DecodedWallet, DestMode, DestSelector, KeyScheme, NonceSequencer, Rng,
+    build_signed_transfer, classify_reject, disposition, grains_to_xus, parse_xus, AmountMode,
+    DestMode, DestSelector, Disposition, KeyScheme, MeterKind, NonceSequencer, Pacer, RateMeter,
+    RateMode, RejectClass, Rng,
 };
 
 /// Default node RPC endpoint (SOV-Station's node default).
 const DEFAULT_RPC: &str = "127.0.0.1:8645";
 /// Hard cap on transactions fired per new block, to keep the tool sane.
 const MAX_RATE: u32 = 100;
+/// Hard cap on the Target-TX/s rate. Well above the chain's ~1–5 TPS inclusion
+/// ceiling (150 s blocks, ~5 KiB PQ txs, 1→4 MiB elastic cap) — the point of the
+/// tool is to demonstrate that ceiling, not to DoS the client machine.
+const MAX_TPS: f64 = 500.0;
 /// Estimated fee reserved per transfer for the local affordability pre-check:
 /// `INTRINSIC_GAS (21_000) × gas_price (1 grain on mainnet)`. The node's mempool
 /// is the real authority — this only lets us surface "insufficient balance"
 /// before firing rather than eating a rejection per tx.
 const FEE_ESTIMATE_GRAINS: u128 = 21_000;
-/// How often the worker polls the tip while idle between blocks.
+/// How often the per-block worker polls the tip while idle between blocks.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-/// How often the connection monitor probes the node while the app is open.
-const CONN_POLL: Duration = Duration::from_millis(2_500);
-/// Timeout for a single connection probe.
-const CONN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often a continuous-mode worker reconciles its nonce + balance with the
+/// node (well under the 150 s block time; also catches external spends fast).
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+/// Back-off after a capacity (mempool/sender-limit) rejection before retrying
+/// the SAME nonce — this is what self-paces the firehose to the drain rate.
+const CAPACITY_BACKOFF: Duration = Duration::from_millis(200);
+/// Back-off after an unclassified submit failure (transport, unknown reject).
+const OTHER_BACKOFF: Duration = Duration::from_millis(500);
+/// The node's default mempool capacity (display hint for the saturation flag;
+/// the node remains the authority — its "mempool is full" rejections are what
+/// actually gate submission).
+const MEMPOOL_CAP_HINT: u64 = 16_384;
+/// Depth at which the meter panel flags the mempool SATURATED (~95% of cap).
+const SATURATION_DEPTH: u64 = MEMPOOL_CAP_HINT / 20 * 19;
+/// Rolling window (seconds) for the live per-second meters.
+const METER_WINDOW_SECS: u64 = 5;
 
 fn main() -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([820.0, 900.0])
-            .with_min_inner_size([640.0, 600.0])
+            .with_inner_size([760.0, 900.0])
+            .with_min_inner_size([620.0, 560.0])
             .with_title("SOV TX Cannon"),
         ..Default::default()
     };
     eframe::run_native(
         "SOV TX Cannon",
         options,
-        Box::new(|cc| Ok(Box::new(CannonApp::new(&cc.egui_ctx)))),
+        Box::new(|_cc| Ok(Box::new(CannonApp::default()))),
     )
     .map_err(|e| format!("GUI failed: {e}"))
 }
 
 /// One unlocked, spendable wallet held in memory for the session.
 ///
-/// `wallet.account` is the seed-DERIVED on-chain id; `wallet.label` is the
-/// keystore's display string. The durable secret is `wallet.seed`, kept in a
-/// `Zeroizing` buffer wiped when this struct drops (on lock, unlock-again, or
-/// app exit). A `Keypair` is never stored — it is derived transiently only for
-/// the instant of signing.
+/// The durable secret is `seed`, kept in a `Zeroizing` buffer so it is wiped from
+/// memory when this struct drops (on lock, unlock-again, or app exit). The
+/// `Keypair` is never stored — it is derived transiently only for the instant of
+/// signing.
 struct UnlockedWallet {
-    wallet: DecodedWallet,
+    label: String,
+    account: AccountId,
+    scheme: KeyScheme,
+    seed: Zeroizing<[u8; 32]>,
     /// Last known liquid balance in grains (read via RPC), for display.
     balance_grains: Option<u128>,
+    /// Whether this wallet is selected to fire (the multi-wallet checklist).
+    fire: bool,
 }
 
-/// `~/.sov-station/` — where SOV-Station keeps its wallet files.
-fn station_dir() -> PathBuf {
+/// The keystore path: `~/.sov-station/wallets.keystore` (same file SOV-Station
+/// writes). Kept overridable in the UI for non-default installs.
+fn default_keystore_path() -> String {
     let home = std::env::var("HOME")
         .ok()
         .or_else(|| std::env::var("USERPROFILE").ok())
         .unwrap_or_default();
-    PathBuf::from(home).join(".sov-station")
-}
-
-/// The PRIMARY keystore: `~/.sov-station/wallets.auto` — the store SOV-Station
-/// itself auto-loads on launch, encrypted under the MASTER passphrase. (The
-/// sibling `wallets.keystore` is a manual export/backup; we also try it and
-/// merge, see [`CannonApp::unlock`].) Kept overridable in the UI.
-fn default_keystore_path() -> String {
-    station_dir()
-        .join("wallets.auto")
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// The secondary (backup/export) keystore path: `~/.sov-station/wallets.keystore`.
-fn backup_keystore_path() -> String {
-    station_dir()
+    PathBuf::from(home)
+        .join(".sov-station")
         .join("wallets.keystore")
         .to_string_lossy()
         .into_owned()
@@ -116,6 +130,7 @@ fn backup_keystore_path() -> String {
 /// A single line in the live per-tx log.
 #[derive(Clone)]
 struct LogLine {
+    wallet: String,
     height: u64,
     to: String,
     amount_grains: u128,
@@ -124,19 +139,49 @@ struct LogLine {
     detail: String,
 }
 
-/// Live status shared between the UI thread and the firing worker.
-#[derive(Default)]
+/// Live per-wallet state the worker publishes for the meter panel.
+#[derive(Clone, Default)]
+struct WalletStat {
+    label: String,
+    next_nonce: u64,
+    balance_grains: Option<u128>,
+    /// Set when this wallet's worker stopped early (why), e.g. affordability.
+    stopped: Option<String>,
+}
+
+/// Live status shared between the UI thread and the firing workers.
 struct Status {
     running: bool,
     tip_height: u64,
-    sent_ok: u64,
-    sent_fail: u64,
-    next_nonce: u64,
+    /// Node mempool depth, polled ~1/s by the monitor thread.
+    mempool_depth: Option<u64>,
+    /// Rolling throughput meters (attempted/accepted/rejected-by-reason).
+    meter: RateMeter,
+    /// The meter's clock origin — all events are stamped relative to this.
+    t0: Instant,
+    /// Per-wallet live state, indexed by worker/wallet order.
+    wallets: Vec<WalletStat>,
+    /// Number of workers still running (0 ⇒ the run has drained/ended).
+    live_workers: usize,
     last_error: String,
-    /// Spend-from balance the worker refreshes each block.
-    from_balance_grains: Option<u128>,
     /// Newest-last per-tx log (bounded).
     log: Vec<LogLine>,
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Self {
+            running: false,
+            tip_height: 0,
+            mempool_depth: None,
+            meter: RateMeter::new(METER_WINDOW_SECS),
+            t0: Instant::now(),
+            wallets: Vec::new(),
+            live_workers: 0,
+            last_error: String::new(),
+            log: Vec::new(),
+        }
+    }
 }
 
 impl Status {
@@ -148,52 +193,62 @@ impl Status {
             self.log.drain(0..len - 500);
         }
     }
+
+    /// Milliseconds since the meter clock origin (the run start).
+    fn now_ms(&self) -> u64 {
+        self.t0.elapsed().as_millis() as u64
+    }
+
+    /// Record a meter event stamped "now".
+    fn record(&mut self, kind: MeterKind) {
+        let now = self.now_ms();
+        self.meter.record(now, kind);
+    }
 }
 
-/// Live node-connection state, fed by the background [`conn_monitor`] thread.
-/// Independent of firing: it probes `height()` every [`CONN_POLL`] while the app
-/// is open, so the header indicator is always current.
-#[derive(Default, Clone)]
-struct ConnState {
-    /// At least one probe has completed (before that: "checking…").
-    probed: bool,
-    ok: bool,
-    tip: u64,
-    /// The REAL error from the last failed probe (never swallowed).
-    error: String,
-}
-
-/// Immutable-per-run configuration handed to the worker thread when firing starts.
-struct RunConfig {
+/// Immutable-per-run configuration handed to ONE worker thread (one wallet).
+struct WorkerConfig {
     rpc_addr: String,
-    /// The seed-DERIVED on-chain id — used for balance/nonce queries and as the
-    /// signed tx's `signer`.
+    /// Index into `Status::wallets` this worker reports under.
+    wallet_index: usize,
+    label: String,
     from: AccountId,
     scheme: KeyScheme,
+    /// This worker's OWN zeroizing seed copy — wiped when the worker returns.
     seed: Zeroizing<[u8; 32]>,
     dests: Vec<AccountId>,
     dest_mode: DestMode,
     amount_mode: AmountMode,
-    rate: u32,
+    /// The rate mode with any per-worker share already applied (Target TX/s is
+    /// split across the selected wallets).
+    mode: RateMode,
     dry_run: bool,
 }
 
-/// A running firing session (its stop flag + thread handle).
+/// A running firing session: one shared stop flag, one monitor thread, and one
+/// worker thread per selected wallet.
 struct Session {
     stop: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
-    started: Instant,
+    handles: Vec<thread::JoinHandle<()>>,
 }
 
 impl Session {
-    /// Signal the worker to stop and join it (so its seed copy is zeroized before
-    /// we return).
+    /// Signal every thread to stop and join them ALL, so each worker's seed copy
+    /// is zeroized before we return.
     fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
+        for h in self.handles.drain(..) {
             let _ = h.join();
         }
     }
+}
+
+/// Which rate-mode radio is selected in the UI.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModeChoice {
+    PerBlock,
+    TargetTps,
+    Firehose,
 }
 
 /// The application state.
@@ -204,19 +259,9 @@ struct CannonApp {
     /// Secret input: wiped on drop and immediately after a successful unlock.
     passphrase: Zeroizing<String>,
     unlock_msg: String,
-    /// Non-secret status from the last balance refresh (errors surfaced, not
-    /// swallowed).
-    balance_msg: String,
 
-    // Live connection indicator (fed by the monitor thread).
-    conn: Arc<Mutex<ConnState>>,
-    conn_addr: Arc<Mutex<String>>,
-    conn_poke: Arc<AtomicBool>,
-    conn_stop: Arc<AtomicBool>,
-
-    // Unlocked wallets + which one to spend from.
+    // Unlocked wallets (each carries its own `fire` checkbox).
     wallets: Vec<UnlockedWallet>,
-    selected: usize,
 
     // Traffic configuration (UI form fields).
     dests_text: String,
@@ -225,7 +270,9 @@ struct CannonApp {
     amount_fixed: String,
     amount_min: String,
     amount_max: String,
+    mode: ModeChoice,
     rate: String,
+    tps: String,
     dry_run: bool,
     config_msg: String,
 
@@ -234,77 +281,39 @@ struct CannonApp {
     session: Option<Session>,
 }
 
-impl CannonApp {
-    fn new(ctx: &eframe::egui::Context) -> Self {
-        apply_theme(ctx);
-        let conn = Arc::new(Mutex::new(ConnState::default()));
-        let conn_addr = Arc::new(Mutex::new(DEFAULT_RPC.to_string()));
-        let conn_poke = Arc::new(AtomicBool::new(true)); // probe immediately
-        let conn_stop = Arc::new(AtomicBool::new(false));
-        {
-            // The monitor holds NO secret material — only the RPC address and the
-            // probe result — so it is detached (not joined) on exit; its at-most-3s
-            // in-flight probe cannot delay shutdown or leak anything.
-            let conn = conn.clone();
-            let addr = conn_addr.clone();
-            let poke = conn_poke.clone();
-            let stop = conn_stop.clone();
-            let ctx = ctx.clone();
-            thread::spawn(move || conn_monitor(conn, addr, poke, stop, ctx));
-        }
+impl Default for CannonApp {
+    fn default() -> Self {
         Self {
             rpc_addr: DEFAULT_RPC.to_string(),
             keystore_path: default_keystore_path(),
             passphrase: Zeroizing::new(String::new()),
             unlock_msg: String::new(),
-            balance_msg: String::new(),
-            conn,
-            conn_addr,
-            conn_poke,
-            conn_stop,
             wallets: Vec::new(),
-            selected: 0,
             dests_text: String::new(),
             dest_random: false,
             amount_random: false,
             amount_fixed: "0.001".to_string(),
             amount_min: "0.001".to_string(),
             amount_max: "0.01".to_string(),
+            mode: ModeChoice::PerBlock,
             rate: "1".to_string(),
+            tps: "2".to_string(),
             dry_run: true,
             config_msg: String::new(),
             status: Arc::new(Mutex::new(Status::default())),
             session: None,
         }
     }
+}
 
+impl CannonApp {
     fn is_running(&self) -> bool {
         self.session.is_some()
     }
 
-    /// Ask the connection monitor to probe NOW (unlock, "Test connection", or an
-    /// address edit).
-    fn poke_connection(&self) {
-        if let Ok(mut a) = self.conn_addr.lock() {
-            if *a != self.rpc_addr {
-                *a = self.rpc_addr.clone();
-            }
-        }
-        self.conn_poke.store(true, Ordering::SeqCst);
-    }
-
-    /// Read + decrypt the wallet stores with the typed passphrase, then WIPE the
-    /// passphrase.
-    ///
-    /// Sources, all with the SAME passphrase, results MERGED (dedup by DERIVED
-    /// account id):
-    ///   1. the UI's keystore path (default `~/.sov-station/wallets.auto`, the
-    ///      store SOV-Station auto-loads — the REAL working wallets), and
-    ///   2. the sibling backup/export `~/.sov-station/wallets.keystore`, so a
-    ///      same-passphrase backup's wallets show too.
-    ///
-    /// A missing or non-decrypting file is skipped; it is an error only if NO
-    /// source yields a spendable wallet.
+    /// Read + decrypt SOV-Station's keystore with the typed passphrase, load the
+    /// spendable wallets, then WIPE the passphrase. Watch-only entries (no seed)
+    /// are skipped — they cannot sign.
     fn unlock(&mut self) {
         if self.is_running() {
             return;
@@ -313,102 +322,96 @@ impl CannonApp {
             self.unlock_msg = "enter your master passphrase".into();
             return;
         }
-
-        let mut candidates = vec![self.keystore_path.trim().to_string()];
-        for extra in [default_keystore_path(), backup_keystore_path()] {
-            if !candidates.contains(&extra) {
-                candidates.push(extra);
+        let text = match std::fs::read_to_string(&self.keystore_path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.unlock_msg = format!("cannot read keystore: {e}");
+                return;
             }
-        }
+        };
+        // Reuse SOV-Station's exact hardened decryption (Argon2id + ChaCha20-Poly1305).
+        let ks = match Keystore::from_encrypted_or_plain(&text, Some(self.passphrase.as_str())) {
+            Ok(ks) => ks,
+            Err(e) => {
+                self.unlock_msg = format!("unlock failed: {e}");
+                self.passphrase.zeroize();
+                return;
+            }
+        };
 
-        let mut merged: Vec<DecodedWallet> = Vec::new();
-        let mut notes: Vec<String> = Vec::new();
-        let mut sources = 0usize;
-        for path in &candidates {
-            let name = PathBuf::from(path)
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.clone());
-            let text = match std::fs::read_to_string(path) {
-                Ok(t) => t,
-                Err(e) => {
-                    notes.push(format!("{name}: not read ({e})"));
+        // Drop any previously unlocked wallets first (zeroizes their seeds).
+        self.wipe_wallets();
+        for (i, entry) in ks.miners.iter().enumerate() {
+            // Skip watch-only entries: empty seed, public key present.
+            if entry.seed_hex.trim().is_empty() {
+                continue;
+            }
+            let scheme = match KeyScheme::from_keystore(entry.scheme.as_deref()) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut seed_bytes = match hex::decode(entry.seed_hex.trim()) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let seed_arr: [u8; 32] = match seed_bytes.as_slice().try_into() {
+                Ok(a) => a,
+                Err(_) => {
+                    wipe_vec(&mut seed_bytes);
                     continue;
                 }
             };
-            // Reuse SOV-Station's exact hardened decryption (Argon2id + ChaCha20-Poly1305).
-            match Keystore::from_encrypted_or_plain(&text, Some(self.passphrase.as_str())) {
-                Ok(ks) => {
-                    let wallets = decode_keystore(&ks);
-                    notes.push(format!("{name}: {} wallet(s)", wallets.len()));
-                    merge_wallets(&mut merged, wallets);
-                    sources += 1;
+            // Move the seed into a zeroizing buffer, then wipe the transient copy.
+            let mut seed = Zeroizing::new(seed_arr);
+            wipe_vec(&mut seed_bytes);
+            let account = match AccountId::new(entry.account.trim()) {
+                Ok(a) => a,
+                Err(_) => {
+                    // Wipe the seed we just built before discarding it.
+                    *seed = [0u8; 32];
+                    continue;
                 }
-                Err(e) => notes.push(format!("{name}: {e}")),
-            }
+            };
+            let label = if entry.account.trim().is_empty() {
+                format!("wallet #{i}")
+            } else {
+                entry.account.trim().to_string()
+            };
+            self.wallets.push(UnlockedWallet {
+                label,
+                account,
+                scheme,
+                seed,
+                balance_grains: None,
+                // Default: only the first wallet fires (the simple single-wallet
+                // case); the user opts additional wallets in via the checklist.
+                fire: self.wallets.is_empty(),
+            });
         }
         // The passphrase has done its job; wipe it from memory now.
         self.passphrase.zeroize();
 
-        if merged.is_empty() {
-            // Neither store yielded a spendable wallet — surface why, per file.
-            self.unlock_msg = if sources == 0 {
-                format!("unlock failed — {}", notes.join("; "))
-            } else {
-                format!(
-                    "unlocked, but no spendable wallets found (watch-only or empty) — {}",
-                    notes.join("; ")
-                )
-            };
-            return;
+        if self.wallets.is_empty() {
+            self.unlock_msg =
+                "unlocked, but no spendable wallets found (watch-only or empty keystore)".into();
+        } else {
+            self.unlock_msg = format!("unlocked {} wallet(s)", self.wallets.len());
+            self.refresh_balances();
         }
-
-        // Drop any previously unlocked wallets first (zeroizes their seeds).
-        self.wipe_wallets();
-        self.wallets = merged
-            .into_iter()
-            .map(|wallet| UnlockedWallet {
-                wallet,
-                balance_grains: None,
-            })
-            .collect();
-        self.selected = 0;
-        self.unlock_msg = format!(
-            "unlocked {} wallet(s) — {}",
-            self.wallets.len(),
-            notes.join("; ")
-        );
-        self.poke_connection();
-        self.refresh_balances();
     }
 
     /// Wipe all in-memory key material (called on lock, re-unlock, and exit).
     fn wipe_wallets(&mut self) {
-        // UnlockedWallet's seed is Zeroizing → wiped on drop.
+        // UnlockedWallet::seed is Zeroizing → wiped on drop.
         self.wallets.clear();
-        self.selected = 0;
     }
 
-    /// Refresh each unlocked wallet's balance from the node, SURFACING any RPC
-    /// error to `balance_msg` (never silently blanking).
+    /// Refresh each unlocked wallet's balance from the node (best-effort).
     fn refresh_balances(&mut self) {
         let client = RpcClient::new(self.rpc_addr.clone()).with_timeout(Duration::from_secs(5));
-        let mut first_err: Option<String> = None;
         for w in &mut self.wallets {
-            match client.balance(&w.wallet.account) {
-                Ok(b) => w.balance_grains = Some(b.grains()),
-                Err(e) => {
-                    w.balance_grains = None;
-                    if first_err.is_none() {
-                        first_err = Some(format!(
-                            "balance query failed for {}: {e}",
-                            short_account(&w.wallet.account)
-                        ));
-                    }
-                }
-            }
+            w.balance_grains = client.balance(&w.account).ok().map(|b| b.grains());
         }
-        self.balance_msg = first_err.unwrap_or_default();
     }
 
     /// Parse the destination textarea into validated account ids.
@@ -443,11 +446,41 @@ impl CannonApp {
         Ok(mode)
     }
 
-    /// Build the full run configuration from the current form; on any error, set
-    /// `config_msg` and return `None`.
-    fn build_run_config(&mut self) -> Option<RunConfig> {
+    /// Parse + validate the rate mode from the UI fields. `n_workers` is how
+    /// many wallets will fire: Target TX/s is split evenly across them so the
+    /// AGGREGATE rate matches what the user typed.
+    fn parse_rate_mode(&self, n_workers: usize) -> Result<RateMode, String> {
+        match self.mode {
+            ModeChoice::PerBlock => match self.rate.trim().parse::<u32>() {
+                Ok(r) if (1..=MAX_RATE).contains(&r) => Ok(RateMode::PerBlock(r)),
+                _ => Err(format!("per-block rate must be between 1 and {MAX_RATE}")),
+            },
+            ModeChoice::TargetTps => match self.tps.trim().parse::<f64>() {
+                Ok(x) if x.is_finite() && (0.1..=MAX_TPS).contains(&x) => {
+                    Ok(RateMode::TargetTps(x / n_workers.max(1) as f64))
+                }
+                _ => Err(format!("target TX/s must be between 0.1 and {MAX_TPS}")),
+            },
+            ModeChoice::Firehose => Ok(RateMode::Firehose),
+        }
+    }
+
+    /// Build one worker config per selected wallet from the current form; on any
+    /// error, set `config_msg` and return `None`.
+    fn build_worker_configs(&mut self) -> Option<Vec<WorkerConfig>> {
         if self.wallets.is_empty() {
             self.config_msg = "unlock a wallet first".into();
+            return None;
+        }
+        let selected: Vec<usize> = self
+            .wallets
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.fire)
+            .map(|(i, _)| i)
+            .collect();
+        if selected.is_empty() {
+            self.config_msg = "select at least one wallet to fire from".into();
             return None;
         }
         let dests = match self.parse_dests() {
@@ -464,66 +497,113 @@ impl CannonApp {
                 return None;
             }
         };
-        let rate: u32 = match self.rate.trim().parse() {
-            Ok(r) if (1..=MAX_RATE).contains(&r) => r,
-            _ => {
-                self.config_msg = format!("rate must be between 1 and {MAX_RATE}");
+        let mode = match self.parse_rate_mode(selected.len()) {
+            Ok(m) => m,
+            Err(e) => {
+                self.config_msg = e;
                 return None;
             }
         };
-        let w = &self.wallets[self.selected];
-        Some(RunConfig {
-            rpc_addr: self.rpc_addr.clone(),
-            from: w.wallet.account.clone(),
-            scheme: w.wallet.scheme,
-            // Clone the seed into a fresh zeroizing buffer moved to the worker.
-            seed: Zeroizing::new(*w.wallet.seed),
-            dests,
-            dest_mode: if self.dest_random {
-                DestMode::Random
-            } else {
-                DestMode::RoundRobin
-            },
-            amount_mode,
-            rate,
-            dry_run: self.dry_run,
-        })
+        let dest_mode = if self.dest_random {
+            DestMode::Random
+        } else {
+            DestMode::RoundRobin
+        };
+        let configs = selected
+            .into_iter()
+            .enumerate()
+            .map(|(worker_i, wallet_i)| {
+                let w = &self.wallets[wallet_i];
+                WorkerConfig {
+                    rpc_addr: self.rpc_addr.clone(),
+                    wallet_index: worker_i,
+                    label: w.label.clone(),
+                    from: w.account.clone(),
+                    scheme: w.scheme,
+                    // Clone the seed into a fresh zeroizing buffer moved to the
+                    // worker (wiped when the worker's config drops on return).
+                    seed: Zeroizing::new(*w.seed),
+                    dests: dests.clone(),
+                    dest_mode,
+                    amount_mode,
+                    mode,
+                    dry_run: self.dry_run,
+                }
+            })
+            .collect();
+        Some(configs)
     }
 
-    /// Start firing: spawn the worker thread with a copy of the signing seed.
+    /// Start firing: spawn one worker per selected wallet (each with its own
+    /// seed copy) plus the shared tip/mempool monitor.
     fn start(&mut self, ctx: &eframe::egui::Context) {
         if self.is_running() {
             return;
         }
-        let Some(cfg) = self.build_run_config() else {
+        let Some(configs) = self.build_worker_configs() else {
             return;
         };
-        // Reset counters for the new run.
+        // Reset counters + per-wallet stats for the new run.
         {
             let mut st = self.status.lock().unwrap();
             *st = Status {
                 running: true,
+                live_workers: configs.len(),
+                wallets: configs
+                    .iter()
+                    .map(|c| WalletStat {
+                        label: c.label.clone(),
+                        ..WalletStat::default()
+                    })
+                    .collect(),
                 ..Status::default()
             };
         }
-        self.config_msg = if cfg.dry_run {
-            "DRY-RUN: building + logging txs, NOT submitting".into()
-        } else {
-            "LIVE: firing signed transactions each new block".into()
+        self.config_msg = match (&configs[0].mode, self.dry_run) {
+            (_, true) => "running (DRY-RUN: building + logging txs, NOT submitting)".into(),
+            (RateMode::PerBlock(n), false) => {
+                format!(
+                    "running: firing {n} tx per new block × {} wallet(s)",
+                    configs.len()
+                )
+            }
+            (RateMode::TargetTps(_), false) => {
+                format!(
+                    "running: pacing ~{} TX/s across {} wallet(s)",
+                    self.tps.trim(),
+                    configs.len()
+                )
+            }
+            (RateMode::Firehose, false) => {
+                format!(
+                    "running: FIREHOSE from {} wallet(s) — mempool is the brake",
+                    configs.len()
+                )
+            }
         };
         let stop = Arc::new(AtomicBool::new(false));
-        let status = self.status.clone();
-        let ctx = ctx.clone();
-        let worker_stop = stop.clone();
-        let handle = thread::spawn(move || run_worker(cfg, status, worker_stop, ctx));
-        self.session = Some(Session {
-            stop,
-            handle: Some(handle),
-            started: Instant::now(),
-        });
+        let mut handles = Vec::with_capacity(configs.len() + 1);
+        // The monitor: tip height + mempool depth, ~1/s.
+        {
+            let status = self.status.clone();
+            let ctx = ctx.clone();
+            let stop = stop.clone();
+            let rpc_addr = self.rpc_addr.clone();
+            handles.push(thread::spawn(move || {
+                run_monitor(rpc_addr, status, stop, ctx)
+            }));
+        }
+        for cfg in configs {
+            let status = self.status.clone();
+            let ctx = ctx.clone();
+            let stop = stop.clone();
+            handles.push(thread::spawn(move || run_worker(cfg, status, stop, ctx)));
+        }
+        self.session = Some(Session { stop, handles });
     }
 
-    /// Stop firing and join the worker (which zeroizes its seed copy on exit).
+    /// Stop firing: halt ALL workers and join them (each worker's seed copy is
+    /// zeroized as its config drops) before returning.
     fn stop(&mut self) {
         if let Some(mut s) = self.session.take() {
             s.stop_and_join();
@@ -537,219 +617,420 @@ impl CannonApp {
 
 impl Drop for CannonApp {
     fn drop(&mut self) {
-        // Ensure the worker's seed copy is wiped, then wipe ours.
+        // Ensure every worker's seed copy is wiped, then wipe ours.
         if let Some(mut s) = self.session.take() {
             s.stop_and_join();
         }
         self.wipe_wallets();
         self.passphrase.zeroize();
-        // The (secret-free) connection monitor exits on its next tick.
-        self.conn_stop.store(true, Ordering::SeqCst);
     }
 }
 
-/// The background connection monitor: probes `height()` on the shared RPC
-/// address every [`CONN_POLL`] (or immediately when poked), publishing the
-/// result — including the REAL error text on failure — to the shared
-/// [`ConnState`]. Holds no secret material, ever.
-fn conn_monitor(
-    conn: Arc<Mutex<ConnState>>,
-    addr: Arc<Mutex<String>>,
-    poke: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    ctx: eframe::egui::Context,
-) {
-    let mut last_probe: Option<Instant> = None;
-    while !stop.load(Ordering::SeqCst) {
-        let due = last_probe.map(|t| t.elapsed() >= CONN_POLL).unwrap_or(true)
-            || poke.swap(false, Ordering::SeqCst);
-        if !due {
-            thread::sleep(Duration::from_millis(100));
-            continue;
-        }
-        last_probe = Some(Instant::now());
-        let target = addr.lock().map(|a| a.clone()).unwrap_or_default();
-        let result = RpcClient::new(target.clone())
-            .with_timeout(CONN_TIMEOUT)
-            .height();
-        if let Ok(mut c) = conn.lock() {
-            c.probed = true;
-            match result {
-                Ok(h) => {
-                    c.ok = true;
-                    c.tip = h;
-                    c.error.clear();
-                }
-                Err(e) => {
-                    c.ok = false;
-                    c.error = format!("Can't reach node at {target}: {e}");
-                }
-            }
-        }
-        ctx.request_repaint();
+/// Best-effort overwrite of a byte vector's contents before it is freed.
+fn wipe_vec(v: &mut Vec<u8>) {
+    for b in v.iter_mut() {
+        *b = 0;
     }
+    v.clear();
 }
 
-/// The firing worker: owns a `Zeroizing` copy of the signing seed for its lifetime
-/// and wipes it on return (normal stop or panic-unwind of this frame).
-///
-/// Each new tip height: refresh the spend-from balance + reconcile the nonce
-/// sequencer against the node, then build `rate` signed transfers and (unless
-/// dry-run) submit them, updating shared status/counters/log. The seed is used
-/// only to derive a transient keypair inside `build_signed_transfer`; the keypair
-/// never outlives a single signature and is never stored or logged.
-fn run_worker(
-    cfg: RunConfig,
+/// The tip/mempool monitor thread: polls `sov_getHeight` + `sov_getMempoolSize`
+/// about once a second and publishes them for the meter panel. Holds no keys.
+fn run_monitor(
+    rpc_addr: String,
     status: Arc<Mutex<Status>>,
     stop: Arc<AtomicBool>,
     ctx: eframe::egui::Context,
 ) {
-    let client = RpcClient::new(cfg.rpc_addr.clone()).with_timeout(Duration::from_secs(15));
-    let mut selector = match DestSelector::new(cfg.dests.clone(), cfg.dest_mode) {
+    let client = RpcClient::new(rpc_addr).with_timeout(Duration::from_secs(5));
+    while !stop.load(Ordering::SeqCst) {
+        let height = client.height().ok();
+        let depth = client.mempool_size().ok();
+        if let Ok(mut st) = status.lock() {
+            if let Some(h) = height {
+                st.tip_height = h;
+            }
+            st.mempool_depth = depth.map(|d| d as u64);
+        }
+        ctx.request_repaint();
+        sleep_interruptible(&stop, Duration::from_secs(1));
+    }
+}
+
+/// What one fire attempt tells the worker loop to do next.
+enum FireResult {
+    /// Sent (or dry-run-built) fine — keep going at full pace.
+    Continue,
+    /// Capacity or unknown failure — back off for `Duration`, nonce held.
+    Backoff(Duration),
+    /// This wallet's run is over (affordability) — exit the worker.
+    Stop,
+}
+
+/// Everything one worker needs across fire attempts (kept in one struct so the
+/// per-mode loops share a single `fire_once` implementation).
+struct WorkerState {
+    client: RpcClient,
+    selector: DestSelector,
+    rng: Rng,
+    seq: NonceSequencer,
+    /// Local balance view for the affordability pre-check (debited per send,
+    /// refreshed from the node each reconcile).
+    known_balance: Option<u128>,
+    /// Last chain height observed (for log lines).
+    height: u64,
+}
+
+/// The firing worker for ONE wallet: owns a `Zeroizing` copy of that wallet's
+/// signing seed for its lifetime and wipes it on return (normal stop or
+/// panic-unwind of this frame). The seed is used only to derive a transient
+/// keypair inside `build_signed_transfer`; the keypair never outlives a single
+/// signature and is never stored or logged.
+///
+/// Per-block mode fires `n` txs on each new tip (the original behavior, with
+/// `NonceSequencer::next`). The continuous modes (Target TX/s, Firehose) use the
+/// commit-on-accept flow instead: PEEK the nonce, build+sign+submit, and only
+/// ADVANCE when the node consumed the slot — a capacity rejection holds the same
+/// nonce and retries after a short back-off, so the account never gaps or wedges.
+fn run_worker(
+    cfg: WorkerConfig,
+    status: Arc<Mutex<Status>>,
+    stop: Arc<AtomicBool>,
+    ctx: eframe::egui::Context,
+) {
+    let selector = match DestSelector::new(cfg.dests.clone(), cfg.dest_mode) {
         Ok(s) => s,
         Err(e) => {
             set_error(&status, &e);
+            worker_finished(&status, &ctx);
             return;
         }
     };
-    let mut rng = Rng::from_entropy();
-    let mut seq = NonceSequencer::new();
-    let mut last_height: Option<u64> = None;
+    let mut ws = WorkerState {
+        client: RpcClient::new(cfg.rpc_addr.clone()).with_timeout(Duration::from_secs(15)),
+        selector,
+        rng: Rng::from_entropy(),
+        seq: NonceSequencer::new(),
+        known_balance: None,
+        height: 0,
+    };
 
+    match cfg.mode {
+        RateMode::PerBlock(n) => run_per_block(&cfg, n, &mut ws, &status, &stop, &ctx),
+        RateMode::TargetTps(tps) => {
+            run_continuous(&cfg, Some(Pacer::new(tps)), &mut ws, &status, &stop)
+        }
+        RateMode::Firehose => run_continuous(&cfg, None, &mut ws, &status, &stop),
+    }
+
+    worker_finished(&status, &ctx);
+    // `cfg` (and its Zeroizing seed) drops here → wiped.
+}
+
+/// Decrement the live-worker count; the LAST worker out marks the run stopped.
+fn worker_finished(status: &Arc<Mutex<Status>>, ctx: &eframe::egui::Context) {
+    if let Ok(mut st) = status.lock() {
+        st.live_workers = st.live_workers.saturating_sub(1);
+        if st.live_workers == 0 {
+            st.running = false;
+        }
+    }
+    ctx.request_repaint();
+}
+
+/// Per-block mode: on each NEW tip, reconcile + fire `rate` transfers (the
+/// original cannon behavior, unchanged except that an affordability stop ends
+/// only THIS wallet's worker, and results feed the shared meters).
+fn run_per_block(
+    cfg: &WorkerConfig,
+    rate: u32,
+    ws: &mut WorkerState,
+    status: &Arc<Mutex<Status>>,
+    stop: &Arc<AtomicBool>,
+    ctx: &eframe::egui::Context,
+) {
+    let mut last_height: Option<u64> = None;
     while !stop.load(Ordering::SeqCst) {
-        let height = match client.height() {
+        let height = match ws.client.height() {
             Ok(h) => h,
             Err(e) => {
-                set_error(&status, &format!("RPC height failed: {e}"));
-                sleep_interruptible(&stop, POLL_INTERVAL);
+                set_error(status, &format!("RPC height failed: {e}"));
+                sleep_interruptible(stop, POLL_INTERVAL);
                 continue;
             }
         };
-        {
-            let mut st = status.lock().unwrap();
-            st.tip_height = height;
-        }
+        ws.height = height;
         ctx.request_repaint();
 
         let is_new = last_height.map(|h| height > h).unwrap_or(true);
         if !is_new {
-            sleep_interruptible(&stop, POLL_INTERVAL);
+            sleep_interruptible(stop, POLL_INTERVAL);
             continue;
         }
         last_height = Some(height);
 
-        // Reconcile the nonce sequencer against the node's reported next nonce.
-        match client.nonce(&cfg.from) {
-            Ok(n) => seq.reconcile(n),
-            Err(e) => {
-                set_error(&status, &format!("RPC nonce failed: {e}"));
-                sleep_interruptible(&stop, POLL_INTERVAL);
-                continue;
-            }
-        }
-        if let Ok(mut st) = status.lock() {
-            st.next_nonce = seq.peek();
+        if !sync_with_node(cfg, ws, status) {
+            sleep_interruptible(stop, POLL_INTERVAL);
+            continue;
         }
 
-        // Refresh spend-from balance for display + the affordability pre-check.
-        let mut known_balance = client.balance(&cfg.from).ok().map(|b| b.grains());
-        if let Ok(mut st) = status.lock() {
-            st.from_balance_grains = known_balance;
-        }
-
-        for _ in 0..cfg.rate {
+        for _ in 0..rate {
             if stop.load(Ordering::SeqCst) {
-                break;
+                return;
             }
-            let to = selector.next(&mut rng);
-            let amount = cfg.amount_mode.pick(&mut rng);
-            let nonce = seq.peek();
-
-            // Local affordability pre-check (the node's mempool is the real gate).
-            if let Some(bal) = known_balance {
-                if bal < amount.saturating_add(FEE_ESTIMATE_GRAINS) {
-                    let detail = format!(
-                        "insufficient balance ({} XUS) for {} XUS + fee — stopping",
-                        grains_to_xus(bal),
-                        grains_to_xus(amount)
-                    );
-                    log_tx(&status, height, &to, amount, nonce, false, &detail);
-                    set_error(&status, &detail);
-                    // Stop this run: continuing would just spew rejects.
-                    stop.store(true, Ordering::SeqCst);
-                    break;
-                }
+            match fire_once(cfg, ws, status, /* commit_on_accept = */ false) {
+                FireResult::Continue => {}
+                FireResult::Backoff(_) => {} // per-block: no pacing, just count it
+                FireResult::Stop => return,
             }
-
-            let stx =
-                match build_signed_transfer(&cfg.seed, cfg.scheme, &cfg.from, &to, amount, nonce) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log_tx(&status, height, &to, amount, nonce, false, &e);
-                        bump_fail(&status);
-                        continue;
-                    }
-                };
-            // Only advance the nonce once we've committed to sending this one.
-            let _ = seq.next();
-            if let Ok(mut st) = status.lock() {
-                st.next_nonce = seq.peek();
-            }
-
-            if cfg.dry_run {
-                log_tx(
-                    &status,
-                    height,
-                    &to,
-                    amount,
-                    nonce,
-                    true,
-                    "dry-run (not submitted)",
-                );
-                bump_ok(&status);
-                // Optimistically debit our local balance view so the affordability
-                // pre-check reflects the spend even without a live submit.
-                if let Some(b) = known_balance.as_mut() {
-                    *b = b.saturating_sub(amount.saturating_add(FEE_ESTIMATE_GRAINS));
-                }
-                continue;
-            }
-
-            match client.submit_transaction(&stx) {
-                Ok(txid) => {
-                    log_tx(
-                        &status,
-                        height,
-                        &to,
-                        amount,
-                        nonce,
-                        true,
-                        &format!("submitted {}", short_hash(&txid.to_hex())),
-                    );
-                    bump_ok(&status);
-                    if let Some(b) = known_balance.as_mut() {
-                        *b = b.saturating_sub(amount.saturating_add(FEE_ESTIMATE_GRAINS));
-                    }
-                }
-                Err(e) => {
-                    log_tx(&status, height, &to, amount, nonce, false, &format!("{e}"));
-                    bump_fail(&status);
-                }
-            }
-        }
-
-        if let Ok(mut st) = status.lock() {
-            st.from_balance_grains = known_balance;
         }
         ctx.request_repaint();
-        sleep_interruptible(&stop, POLL_INTERVAL);
+        sleep_interruptible(stop, POLL_INTERVAL);
+    }
+}
+
+/// Continuous modes: Target TX/s (`pacer = Some`) or Firehose (`pacer = None`).
+/// Reconciles nonce + balance with the node every [`RECONCILE_INTERVAL`], and
+/// uses the commit-on-accept nonce flow (see [`fire_once`]).
+fn run_continuous(
+    cfg: &WorkerConfig,
+    mut pacer: Option<Pacer>,
+    ws: &mut WorkerState,
+    status: &Arc<Mutex<Status>>,
+    stop: &Arc<AtomicBool>,
+) {
+    let started = Instant::now();
+    let mut last_sync: Option<Instant> = None;
+
+    'run: while !stop.load(Ordering::SeqCst) {
+        // Periodic reconciliation against the node (nonce floor, balance, tip).
+        let due_sync = last_sync
+            .map(|t| t.elapsed() >= RECONCILE_INTERVAL)
+            .unwrap_or(true);
+        if due_sync {
+            if !sync_with_node(cfg, ws, status) {
+                // Node unreachable: idle briefly, keep trying (nonce is held).
+                sleep_interruptible(stop, POLL_INTERVAL);
+                continue;
+            }
+            last_sync = Some(Instant::now());
+        }
+
+        let due = match pacer.as_mut() {
+            Some(p) => p.take_due(started.elapsed()),
+            None => 1, // firehose: one per iteration, as fast as the loop spins
+        };
+        if due == 0 {
+            // Paced mode with nothing due yet: sleep a short beat (no busy-spin).
+            sleep_interruptible(stop, Duration::from_millis(25));
+            continue;
+        }
+        for _ in 0..due {
+            if stop.load(Ordering::SeqCst) {
+                break 'run;
+            }
+            match fire_once(cfg, ws, status, /* commit_on_accept = */ true) {
+                FireResult::Continue => {}
+                FireResult::Backoff(d) => {
+                    sleep_interruptible(stop, d);
+                    break; // re-check pacing/reconcile after a back-off
+                }
+                FireResult::Stop => break 'run,
+            }
+        }
+        if pacer.is_none() {
+            // Firehose: a tiny yield so the UI thread and monitor stay live.
+            thread::yield_now();
+        }
+    }
+}
+
+/// Refresh this wallet's nonce floor + balance from the node and publish them.
+/// Returns false if the node was unreachable (the caller idles and retries).
+fn sync_with_node(cfg: &WorkerConfig, ws: &mut WorkerState, status: &Arc<Mutex<Status>>) -> bool {
+    match ws.client.nonce(&cfg.from) {
+        Ok(n) => ws.seq.reconcile(n),
+        Err(e) => {
+            set_error(status, &format!("RPC nonce failed: {e}"));
+            return false;
+        }
+    }
+    ws.known_balance = ws.client.balance(&cfg.from).ok().map(|b| b.grains());
+    if let Ok(h) = ws.client.height() {
+        ws.height = h;
+    }
+    publish_wallet_stat(cfg, ws, status, None);
+    true
+}
+
+/// Publish this wallet's live stat row (next nonce, balance, optional stop
+/// reason) into the shared status.
+fn publish_wallet_stat(
+    cfg: &WorkerConfig,
+    ws: &WorkerState,
+    status: &Arc<Mutex<Status>>,
+    stopped: Option<String>,
+) {
+    if let Ok(mut st) = status.lock() {
+        if let Some(wstat) = st.wallets.get_mut(cfg.wallet_index) {
+            wstat.next_nonce = ws.seq.peek();
+            wstat.balance_grains = ws.known_balance;
+            if stopped.is_some() {
+                wstat.stopped = stopped;
+            }
+        }
+    }
+}
+
+/// Build, sign, and (unless dry-run) submit ONE transfer at the sequencer's
+/// peeked nonce, then apply the nonce rule that keeps the account gap-free:
+///
+/// * ACCEPT (or dry-run build) → commit (`advance`).
+/// * Capacity rejection (`mempool is full` / `reached its mempool limit`) → the
+///   slot was NOT consumed: hold the SAME nonce, back off, retry. This is what
+///   self-paces the firehose to the mempool's drain rate.
+/// * `stale transaction` → our txs mined and the node moved ahead: re-query the
+///   node's next nonce and reconcile FORWARD (never backward).
+/// * `already in the pool` / `already pooled` → the slot IS consumed by our own
+///   earlier submit (e.g. after a transport timeout that actually landed):
+///   commit and move on.
+/// * `insufficient balance` → stop THIS wallet's run and surface why.
+/// * Anything else → count it, hold the nonce (not provably consumed), back off.
+///
+/// Per-block mode passes `commit_on_accept = false` and keeps its original
+/// unconditional `next()` semantics (allocate on send).
+fn fire_once(
+    cfg: &WorkerConfig,
+    ws: &mut WorkerState,
+    status: &Arc<Mutex<Status>>,
+    commit_on_accept: bool,
+) -> FireResult {
+    let to = ws.selector.next(&mut ws.rng);
+    let amount = cfg.amount_mode.pick(&mut ws.rng);
+    let nonce = ws.seq.peek();
+
+    // Local affordability pre-check (the node's mempool is the real gate).
+    if let Some(bal) = ws.known_balance {
+        if bal < amount.saturating_add(FEE_ESTIMATE_GRAINS) {
+            let detail = format!(
+                "insufficient balance ({} XUS) for {} XUS + fee — stopping this wallet",
+                grains_to_xus(bal),
+                grains_to_xus(amount)
+            );
+            record(status, MeterKind::RejAfford);
+            log_tx(status, cfg, ws.height, &to, amount, nonce, false, &detail);
+            set_error(status, &format!("{}: {detail}", cfg.label));
+            publish_wallet_stat(cfg, ws, status, Some(detail));
+            return FireResult::Stop;
+        }
     }
 
-    // Mark stopped for the UI. `cfg` (and its Zeroizing seed) drops here → wiped.
-    if let Ok(mut st) = status.lock() {
-        st.running = false;
+    let stx = match build_signed_transfer(&cfg.seed, cfg.scheme, &cfg.from, &to, amount, nonce) {
+        Ok(s) => s,
+        Err(e) => {
+            record(status, MeterKind::Attempted);
+            record(status, MeterKind::RejOther);
+            log_tx(status, cfg, ws.height, &to, amount, nonce, false, &e);
+            return FireResult::Continue;
+        }
+    };
+    record(status, MeterKind::Attempted);
+
+    if !commit_on_accept {
+        // Per-block mode: allocate the nonce now (original behavior).
+        let _ = ws.seq.next();
     }
-    ctx.request_repaint();
+
+    if cfg.dry_run {
+        record(status, MeterKind::Accepted);
+        if commit_on_accept {
+            ws.seq.advance();
+        }
+        log_tx(
+            status,
+            cfg,
+            ws.height,
+            &to,
+            amount,
+            nonce,
+            true,
+            "dry-run (not submitted)",
+        );
+        // Optimistically debit our local balance view so the affordability
+        // pre-check reflects the spend even without a live submit.
+        debit(ws, amount);
+        publish_wallet_stat(cfg, ws, status, None);
+        return FireResult::Continue;
+    }
+
+    match ws.client.submit_transaction(&stx) {
+        Ok(txid) => {
+            record(status, MeterKind::Accepted);
+            if commit_on_accept {
+                ws.seq.advance();
+            }
+            log_tx(
+                status,
+                cfg,
+                ws.height,
+                &to,
+                amount,
+                nonce,
+                true,
+                &format!("submitted {}", short_hash(&txid.to_hex())),
+            );
+            debit(ws, amount);
+            publish_wallet_stat(cfg, ws, status, None);
+            FireResult::Continue
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            let class = classify_reject(&msg);
+            record(
+                status,
+                match class {
+                    RejectClass::Capacity => MeterKind::RejCapacity,
+                    RejectClass::NonceStale | RejectClass::NonceOccupied => MeterKind::RejNonce,
+                    RejectClass::Insufficient => MeterKind::RejAfford,
+                    RejectClass::Other => MeterKind::RejOther,
+                },
+            );
+            log_tx(status, cfg, ws.height, &to, amount, nonce, false, &msg);
+            match disposition(class) {
+                Disposition::HoldAndRetry => FireResult::Backoff(CAPACITY_BACKOFF),
+                Disposition::Advance => {
+                    if commit_on_accept {
+                        ws.seq.advance();
+                    }
+                    publish_wallet_stat(cfg, ws, status, None);
+                    FireResult::Continue
+                }
+                Disposition::ReconcileForward => {
+                    if let Ok(n) = ws.client.nonce(&cfg.from) {
+                        ws.seq.reconcile(n);
+                    }
+                    publish_wallet_stat(cfg, ws, status, None);
+                    FireResult::Continue
+                }
+                Disposition::StopWallet => {
+                    set_error(status, &format!("{}: {msg}", cfg.label));
+                    publish_wallet_stat(cfg, ws, status, Some(msg));
+                    FireResult::Stop
+                }
+                Disposition::HoldAndRetryOther => {
+                    set_error(status, &format!("{}: {msg}", cfg.label));
+                    FireResult::Backoff(OTHER_BACKOFF)
+                }
+            }
+        }
+    }
+}
+
+/// Debit the local balance view by amount + estimated fee (pre-check only).
+fn debit(ws: &mut WorkerState, amount: u128) {
+    if let Some(b) = ws.known_balance.as_mut() {
+        *b = b.saturating_sub(amount.saturating_add(FEE_ESTIMATE_GRAINS));
+    }
 }
 
 fn short_hash(h: &str) -> String {
@@ -768,7 +1049,7 @@ fn sleep_interruptible(stop: &Arc<AtomicBool>, dur: Duration) {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        thread::sleep(step);
+        thread::sleep(step.min(dur - slept));
         slept += step;
     }
 }
@@ -779,21 +1060,16 @@ fn set_error(status: &Arc<Mutex<Status>>, msg: &str) {
     }
 }
 
-fn bump_ok(status: &Arc<Mutex<Status>>) {
+fn record(status: &Arc<Mutex<Status>>, kind: MeterKind) {
     if let Ok(mut st) = status.lock() {
-        st.sent_ok += 1;
-    }
-}
-
-fn bump_fail(status: &Arc<Mutex<Status>>) {
-    if let Ok(mut st) = status.lock() {
-        st.sent_fail += 1;
+        st.record(kind);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn log_tx(
     status: &Arc<Mutex<Status>>,
+    cfg: &WorkerConfig,
     height: u64,
     to: &AccountId,
     amount_grains: u128,
@@ -803,6 +1079,7 @@ fn log_tx(
 ) {
     if let Ok(mut st) = status.lock() {
         st.push_log(LogLine {
+            wallet: cfg.label.clone(),
             height,
             to: to.as_str().to_string(),
             amount_grains,
@@ -813,431 +1090,398 @@ fn log_tx(
     }
 }
 
-// ---- Theme + shared colors ------------------------------------------------
-
-const COL_OK: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(96, 200, 120);
-const COL_ERR: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(235, 100, 100);
-const COL_WARN: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(235, 180, 80);
-const COL_DIM: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(150, 155, 165);
-
-/// A clean dark theme (slightly softer than egui's default dark).
-fn apply_theme(ctx: &eframe::egui::Context) {
-    use eframe::egui;
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = egui::Color32::from_rgb(22, 24, 28);
-    v.window_fill = egui::Color32::from_rgb(22, 24, 28);
-    v.extreme_bg_color = egui::Color32::from_rgb(14, 15, 18);
-    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(30, 33, 39);
-    v.selection.bg_fill = egui::Color32::from_rgb(45, 90, 140);
-    ctx.set_visuals(v);
-    let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    ctx.set_style(style);
-}
-
-/// A titled section card.
-fn section<R>(
-    ui: &mut eframe::egui::Ui,
-    title: &str,
-    add: impl FnOnce(&mut eframe::egui::Ui) -> R,
-) -> R {
-    use eframe::egui;
-    egui::Frame::group(ui.style())
-        .fill(egui::Color32::from_rgb(27, 30, 36))
-        .inner_margin(egui::Margin::same(10.0))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(title)
-                    .strong()
-                    .size(15.0)
-                    .color(egui::Color32::from_rgb(210, 215, 225)),
-            );
-            ui.add_space(6.0);
-            ui.set_width(ui.available_width());
-            add(ui)
-        })
-        .inner
-}
-
-fn fmt_elapsed(d: Duration) -> String {
-    let s = d.as_secs();
-    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
-}
-
 impl eframe::App for CannonApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         use eframe::egui;
 
-        // Keep the connection indicator + elapsed clock ticking even when idle.
-        ctx.request_repaint_after(Duration::from_millis(500));
-
-        let running = self.is_running();
-        let conn = self.conn.lock().map(|c| c.clone()).unwrap_or_default();
-
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("SOV TX Cannon");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Live node indicator — always visible, top right too.
-                        if !conn.probed {
-                            ui.colored_label(COL_DIM, "● checking…");
-                        } else if conn.ok {
-                            ui.colored_label(COL_OK, format!("● Connected — tip {}", conn.tip));
-                        } else {
-                            ui.colored_label(COL_ERR, "● Disconnected");
-                        }
-                    });
-                });
+                ui.heading("SOV TX Cannon");
                 ui.label(
                     egui::RichText::new(
-                        "Fires signed transparent transfers each new block. Unlock → pick wallet → paste targets → set rate → (dry-run) → fire.",
+                        "Automated transaction traffic generator — per-block, paced TX/s, or firehose.",
                     )
                     .small()
-                    .color(COL_DIM),
+                    .weak(),
                 );
                 ui.add_space(8.0);
 
-                // ---- Connection --------------------------------------------
-                section(ui, "Connection", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Node RPC");
-                        let resp = ui.add_enabled(
-                            !running,
-                            egui::TextEdit::singleline(&mut self.rpc_addr)
-                                .hint_text(DEFAULT_RPC)
-                                .desired_width(240.0),
-                        )
-                        .on_hover_text("host:port of the node's JSON-RPC (SOV-Station default 127.0.0.1:8645)");
-                        if resp.changed() {
-                            self.poke_connection();
-                        }
-                        if ui
-                            .button("Test connection")
-                            .on_hover_text("Probe the node's height RPC now")
-                            .clicked()
-                        {
-                            self.poke_connection();
-                        }
-                    });
-                    // The prominent live status line (real error, never swallowed).
-                    if !conn.probed {
-                        ui.colored_label(COL_DIM, "● checking node…");
-                    } else if conn.ok {
-                        ui.colored_label(
-                            COL_OK,
-                            format!("● Connected — tip {}", conn.tip),
-                        );
-                    } else {
-                        ui.colored_label(COL_ERR, format!("● {}", conn.error));
-                    }
-                });
-                ui.add_space(6.0);
+                let running = self.is_running();
+                if running {
+                    // Keep the meters live without worker-driven repaints.
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                }
 
-                // ---- Wallet -------------------------------------------------
-                section(ui, "Wallet", |ui| {
-                    egui::Grid::new("wallet_grid").num_columns(2).show(ui, |ui| {
-                        ui.label("Keystore");
-                        ui.add_enabled(
-                            !running,
-                            egui::TextEdit::singleline(&mut self.keystore_path)
-                                .desired_width(360.0),
-                        )
-                        .on_hover_text(
-                            "SOV-Station's auto-loaded store (wallets.auto). A same-passphrase \
-                             wallets.keystore backup is also tried and merged automatically.",
-                        );
-                        ui.end_row();
+                // ---- 1. Connect + Unlock ------------------------------------
+                egui::CollapsingHeader::new("1 · Connect & Unlock")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        egui::Grid::new("conn").num_columns(2).show(ui, |ui| {
+                            ui.label("Node RPC");
+                            ui.add_enabled(
+                                !running,
+                                egui::TextEdit::singleline(&mut self.rpc_addr)
+                                    .hint_text(DEFAULT_RPC)
+                                    .desired_width(320.0),
+                            );
+                            ui.end_row();
 
-                        ui.label("Passphrase");
-                        let pw = egui::TextEdit::singleline(&mut *self.passphrase)
-                            .password(true)
-                            .hint_text("master passphrase")
-                            .desired_width(360.0);
-                        ui.add_enabled(!running && self.wallets.is_empty(), pw)
-                            .on_hover_text("SOV-Station's MASTER passphrase — wiped from memory right after unlock");
-                        ui.end_row();
-                    });
+                            ui.label("Keystore");
+                            ui.add_enabled(
+                                !running,
+                                egui::TextEdit::singleline(&mut self.keystore_path)
+                                    .desired_width(320.0),
+                            );
+                            ui.end_row();
 
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(!running, egui::Button::new("Unlock wallets"))
-                            .on_hover_text("Decrypt the keystore(s) and load spendable wallets")
-                            .clicked()
-                        {
-                            self.unlock();
-                        }
-                        if !self.wallets.is_empty()
-                            && ui
-                                .add_enabled(!running, egui::Button::new("Lock / wipe keys"))
-                                .on_hover_text("Zeroize every seed held in memory")
+                            ui.label("Passphrase");
+                            let pw = egui::TextEdit::singleline(&mut *self.passphrase)
+                                .password(true)
+                                .hint_text("master passphrase")
+                                .desired_width(320.0);
+                            ui.add_enabled(!running && self.wallets.is_empty(), pw);
+                            ui.end_row();
+                        });
+
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!running, egui::Button::new("Unlock wallets"))
                                 .clicked()
-                        {
-                            self.wipe_wallets();
-                            self.unlock_msg = "keys wiped from memory".into();
-                        }
-                        if !self.wallets.is_empty() && ui.button("Refresh balances").clicked() {
-                            self.refresh_balances();
+                            {
+                                self.unlock();
+                            }
+                            if !self.wallets.is_empty()
+                                && ui
+                                    .add_enabled(!running, egui::Button::new("Lock / wipe keys"))
+                                    .clicked()
+                            {
+                                self.wipe_wallets();
+                                self.unlock_msg = "keys wiped from memory".into();
+                            }
+                            if !self.wallets.is_empty() && ui.button("Refresh balances").clicked() {
+                                self.refresh_balances();
+                            }
+                        });
+                        if !self.unlock_msg.is_empty() {
+                            ui.label(egui::RichText::new(&self.unlock_msg).small().weak());
                         }
                     });
-                    if !self.unlock_msg.is_empty() {
-                        ui.label(egui::RichText::new(&self.unlock_msg).small().color(COL_DIM));
-                    }
-                    if !self.balance_msg.is_empty() {
-                        ui.colored_label(COL_WARN, &self.balance_msg);
-                    }
 
-                    if !self.wallets.is_empty() {
-                        ui.add_space(4.0);
-                        ui.separator();
-                        ui.label("Spend from:");
-                        let display = |w: &UnlockedWallet| {
-                            format!("{} — {}", w.wallet.label, short_account(&w.wallet.account))
-                        };
-                        egui::ComboBox::from_id_salt("spend_from")
-                            .width(360.0)
-                            .selected_text(
-                                self.wallets.get(self.selected).map(display).unwrap_or_default(),
-                            )
-                            .show_ui(ui, |ui| {
-                                for (i, w) in self.wallets.iter().enumerate() {
+                // ---- 2. Fire-from wallets (multi-select) --------------------
+                if !self.wallets.is_empty() {
+                    egui::CollapsingHeader::new("2 · Fire from (select wallets)")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Each checked wallet fires in parallel with its own nonce stream. \
+                                     One wallet is capped by the node's per-sender mempool share (~256 \
+                                     pending); check several to push the pool toward its 16,384 cap.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.add_enabled_ui(!running, |ui| {
+                                for w in &mut self.wallets {
                                     let bal = w
                                         .balance_grains
-                                        .map(|g| format!("  ({} XUS)", grains_to_xus(g)))
+                                        .map(|g| format!("  ·  {} XUS", grains_to_xus(g)))
                                         .unwrap_or_default();
-                                    ui.add_enabled_ui(!running, |ui| {
-                                        ui.selectable_value(
-                                            &mut self.selected,
-                                            i,
-                                            format!("{}{bal}", display(w)),
-                                        );
-                                    });
+                                    ui.checkbox(&mut w.fire, format!("{}{bal}", w.label));
+                                    ui.label(
+                                        egui::RichText::new(format!("      {}", w.account.as_str()))
+                                            .small()
+                                            .weak()
+                                            .monospace(),
+                                    );
                                 }
                             });
-                        if let Some(w) = self.wallets.get(self.selected) {
-                            let bal = w
-                                .balance_grains
-                                .map(|g| format!("{} XUS", grains_to_xus(g)))
-                                .unwrap_or_else(|| "unknown (node unreachable?)".into());
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "on-chain id {}  ·  balance {bal}",
-                                    w.wallet.account.as_str()
-                                ))
-                                .small()
-                                .monospace()
-                                .color(COL_DIM),
-                            )
-                            .on_hover_text(
-                                "The REAL on-chain account id, derived from this wallet's key \
-                                 (the keystore name above is only a display label).",
-                            );
-                        }
-                    }
-                });
-                ui.add_space(6.0);
+                        });
 
-                // ---- Targets ------------------------------------------------
-                if !self.wallets.is_empty() {
-                    section(ui, "Targets", |ui| {
-                        ui.add_enabled_ui(!running, |ui| {
+                    // ---- 3. Configure ---------------------------------------
+                    egui::CollapsingHeader::new("3 · Configure traffic")
+                        .default_open(true)
+                        .show(ui, |ui| {
                             ui.label("Destinations (one account id per line):");
-                            ui.add(
+                            ui.add_enabled(
+                                !running,
                                 egui::TextEdit::multiline(&mut self.dests_text)
                                     .hint_text("alice.sov\nbob.sov\ncarol.sov")
                                     .desired_rows(4)
                                     .desired_width(f32::INFINITY),
                             );
-                            ui.horizontal(|ui| {
-                                ui.label("Pick destination:");
-                                ui.radio_value(&mut self.dest_random, false, "round-robin");
-                                ui.radio_value(&mut self.dest_random, true, "random");
+                            ui.add_enabled_ui(!running, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Pick destination:");
+                                    ui.radio_value(&mut self.dest_random, false, "round-robin");
+                                    ui.radio_value(&mut self.dest_random, true, "random");
+                                });
                             });
 
                             ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.label("Amount (XUS):");
-                                ui.radio_value(&mut self.amount_random, false, "fixed");
-                                ui.radio_value(&mut self.amount_random, true, "random range");
-                            });
-                            if self.amount_random {
+                            ui.add_enabled_ui(!running, |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label("min");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.amount_min)
-                                            .desired_width(90.0),
-                                    );
-                                    ui.label("max");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.amount_max)
-                                            .desired_width(90.0),
-                                    );
+                                    ui.label("Amount (XUS):");
+                                    ui.radio_value(&mut self.amount_random, false, "fixed");
+                                    ui.radio_value(&mut self.amount_random, true, "random range");
                                 });
-                            } else {
-                                ui.horizontal(|ui| {
-                                    ui.label("value");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.amount_fixed)
-                                            .desired_width(90.0),
-                                    );
-                                });
-                            }
+                                if self.amount_random {
+                                    ui.horizontal(|ui| {
+                                        ui.label("min");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.amount_min)
+                                                .desired_width(90.0),
+                                        );
+                                        ui.label("max");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.amount_max)
+                                                .desired_width(90.0),
+                                        );
+                                    });
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        ui.label("value");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.amount_fixed)
+                                                .desired_width(90.0),
+                                        );
+                                    });
+                                }
 
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.label(format!("Rate (tx per new block, 1–{MAX_RATE}):"));
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.rate).desired_width(60.0),
-                                )
-                                .on_hover_text("How many transfers to fire each time a NEW block arrives");
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label("Rate mode:");
+                                    ui.radio_value(&mut self.mode, ModeChoice::PerBlock, "Per block");
+                                    ui.radio_value(
+                                        &mut self.mode,
+                                        ModeChoice::TargetTps,
+                                        "Target TX/s",
+                                    );
+                                    ui.radio_value(&mut self.mode, ModeChoice::Firehose, "Firehose (MAX)");
+                                });
+                                match self.mode {
+                                    ModeChoice::PerBlock => {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!(
+                                                "Tx per new block (1–{MAX_RATE}):"
+                                            ));
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.rate)
+                                                    .desired_width(60.0),
+                                            );
+                                        });
+                                    }
+                                    ModeChoice::TargetTps => {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!(
+                                                "Target TX/s, aggregate (0.1–{MAX_TPS}):"
+                                            ));
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.tps)
+                                                    .desired_width(60.0),
+                                            );
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Steady pace decoupled from blocks; split evenly across the selected wallets. \
+                                                 On-chain inclusion tops out around 1–5 TPS — expect the surplus to pool up.",
+                                            )
+                                            .small()
+                                            .weak(),
+                                        );
+                                    }
+                                    ModeChoice::Firehose => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "No pacing: signs + submits flat-out until the mempool pushes back, \
+                                                 then holds the nonce, backs off, and retries — self-pacing to the drain rate.",
+                                            )
+                                            .small()
+                                            .weak(),
+                                        );
+                                    }
+                                }
+                                ui.checkbox(
+                                    &mut self.dry_run,
+                                    "Dry-run (build + log txs, do NOT submit)",
+                                );
                             });
                         });
-                    });
+
+                    // ---- 4. Start / Stop ------------------------------------
                     ui.add_space(6.0);
-
-                    // ---- Fire -----------------------------------------------
-                    section(ui, "Fire", |ui| {
-                        ui.add_enabled_ui(!running, |ui| {
-                            ui.checkbox(
-                                &mut self.dry_run,
-                                egui::RichText::new(
-                                    "Dry-run — build + log transactions, do NOT submit",
-                                )
-                                .strong(),
-                            )
-                            .on_hover_text("Uncheck only when you want REAL transactions on the wire");
-                        });
-                        if self.dry_run {
-                            ui.colored_label(COL_WARN, "DRY-RUN mode: nothing will be submitted");
-                        }
-                        ui.add_space(4.0);
-
-                        // The one big, unmistakable Start/Stop control.
-                        let (label, fill) = if running {
-                            ("■  STOP", COL_ERR)
-                        } else if self.dry_run {
-                            ("▶  Start firing (dry-run)", egui::Color32::from_rgb(60, 95, 145))
-                        } else {
-                            ("▶  Start firing", egui::Color32::from_rgb(40, 120, 70))
-                        };
-                        let big = egui::Button::new(
-                            egui::RichText::new(label)
-                                .size(18.0)
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                        )
-                        .fill(fill)
-                        .min_size(egui::vec2(ui.available_width(), 40.0));
-                        if ui
-                            .add(big)
-                            .on_hover_text(if running {
-                                "Stop immediately — joins the worker and wipes its seed copy"
+                    ui.horizontal(|ui| {
+                        if !running {
+                            let label = if self.dry_run {
+                                "▶ Start (dry-run)"
                             } else {
-                                "Begin firing on each new block"
-                            })
-                            .clicked()
-                        {
-                            if running {
-                                self.stop();
-                            } else {
+                                "▶ Start firing"
+                            };
+                            if ui
+                                .add(egui::Button::new(egui::RichText::new(label).strong()))
+                                .clicked()
+                            {
                                 self.start(ctx);
                             }
+                        } else if ui
+                            .add(egui::Button::new(egui::RichText::new("■ Stop").strong()))
+                            .clicked()
+                        {
+                            self.stop();
                         }
-                        if !self.config_msg.is_empty() {
-                            ui.label(egui::RichText::new(&self.config_msg).small().color(COL_DIM));
-                        }
+                    });
+                    if !self.config_msg.is_empty() {
+                        ui.label(egui::RichText::new(&self.config_msg).small().weak());
+                    }
+                }
 
-                        // Run state + live counters.
-                        ui.add_space(4.0);
-                        let st = self.status.lock().unwrap();
-                        ui.horizontal(|ui| {
-                            if running {
-                                ui.colored_label(COL_OK, "● RUNNING");
-                                if let Some(s) = &self.session {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "elapsed {}",
-                                            fmt_elapsed(s.started.elapsed())
-                                        ))
-                                        .monospace(),
+                // ---- 5. Live meters ------------------------------------------
+                ui.add_space(10.0);
+                ui.separator();
+                ui.heading("Live meters");
+                let st = self.status.lock().unwrap();
+                let now = st.now_ms();
+                let rate = |k: MeterKind| st.meter.rate(now, k);
+                let attempted_s = rate(MeterKind::Attempted);
+                let accepted_s = rate(MeterKind::Accepted);
+                let rej_cap_s = rate(MeterKind::RejCapacity);
+                let rej_nonce_s = rate(MeterKind::RejNonce);
+                let rej_aff_s = rate(MeterKind::RejAfford);
+                let rej_other_s = rate(MeterKind::RejOther);
+                let rejected_s = rej_cap_s + rej_nonce_s + rej_aff_s + rej_other_s;
+                let sent_ok = st.meter.total(MeterKind::Accepted);
+                let sent_fail = st.meter.total(MeterKind::RejCapacity)
+                    + st.meter.total(MeterKind::RejNonce)
+                    + st.meter.total(MeterKind::RejAfford)
+                    + st.meter.total(MeterKind::RejOther);
+
+                egui::Grid::new("meters").num_columns(2).show(ui, |ui| {
+                    ui.label("Running");
+                    ui.label(if st.running {
+                        format!("yes ({} worker(s))", st.live_workers)
+                    } else {
+                        "no".into()
+                    });
+                    ui.end_row();
+                    ui.label("Tip height");
+                    ui.label(st.tip_height.to_string());
+                    ui.end_row();
+                    ui.label("Attempted / s");
+                    ui.label(format!("{attempted_s:.1}"));
+                    ui.end_row();
+                    ui.label("Accepted / s");
+                    ui.label(
+                        egui::RichText::new(format!("{accepted_s:.1}"))
+                            .color(egui::Color32::from_rgb(90, 170, 90)),
+                    );
+                    ui.end_row();
+                    ui.label("Rejected / s");
+                    ui.label(format!(
+                        "{rejected_s:.1}   (mempool-full {rej_cap_s:.1} · nonce {rej_nonce_s:.1} · afford {rej_aff_s:.1} · other {rej_other_s:.1})"
+                    ));
+                    ui.end_row();
+                    ui.label("Mempool depth");
+                    match st.mempool_depth {
+                        Some(d) => {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{d} / {MEMPOOL_CAP_HINT}"));
+                                if d >= SATURATION_DEPTH {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(220, 60, 60),
+                                        egui::RichText::new("SATURATED").strong(),
                                     );
                                 }
-                            } else {
-                                ui.colored_label(COL_DIM, "● STOPPED");
-                            }
-                            ui.separator();
-                            ui.colored_label(COL_OK, format!("OK {}", st.sent_ok));
-                            ui.colored_label(COL_ERR, format!("failed {}", st.sent_fail));
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "tip {} · next nonce {}",
-                                    st.tip_height, st.next_nonce
-                                ))
-                                .monospace(),
-                            );
-                        });
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "spend-from balance: {}",
-                                st.from_balance_grains
-                                    .map(|g| format!("{} XUS", grains_to_xus(g)))
-                                    .unwrap_or_else(|| "—".into())
-                            ))
-                            .small()
-                            .color(COL_DIM),
-                        );
-                        if !st.last_error.is_empty() {
-                            ui.colored_label(COL_ERR, &st.last_error);
-                        }
-
-                        // Colorized scrolling per-tx log.
-                        ui.add_space(6.0);
-                        ui.label("Per-tx log (newest last):");
-                        egui::Frame::default()
-                            .fill(egui::Color32::from_rgb(14, 15, 18))
-                            .inner_margin(egui::Margin::same(6.0))
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                egui::ScrollArea::vertical()
-                                    .max_height(220.0)
-                                    .stick_to_bottom(true)
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        if st.log.is_empty() {
-                                            ui.label(
-                                                egui::RichText::new("no transactions yet")
-                                                    .small()
-                                                    .color(COL_DIM),
-                                            );
-                                        }
-                                        for line in &st.log {
-                                            let (mark, color) = if line.ok {
-                                                ("OK ", COL_OK)
-                                            } else {
-                                                ("ERR", COL_ERR)
-                                            };
-                                            ui.horizontal(|ui| {
-                                                ui.colored_label(color, mark);
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "h{} n{} → {} · {} XUS · {}",
-                                                        line.height,
-                                                        line.nonce,
-                                                        line.to,
-                                                        grains_to_xus(line.amount_grains),
-                                                        line.detail
-                                                    ))
-                                                    .small()
-                                                    .monospace(),
-                                                );
-                                            });
-                                        }
-                                    });
                             });
+                        }
+                        None => {
+                            ui.label("—");
+                        }
+                    }
+                    ui.end_row();
+                    ui.label("Totals");
+                    ui.label(format!("sent OK {sent_ok} · failed {sent_fail}"));
+                    ui.end_row();
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Chain inclusion tops out near 1–5 TPS (150 s blocks, ~5 KiB PQ txs, 1→4 MiB cap): \
+                         accepted/s tracks the mempool's drain, attempts and rejections show the pressure.",
+                    )
+                    .small()
+                    .weak(),
+                );
+
+                if !st.wallets.is_empty() {
+                    ui.add_space(4.0);
+                    egui::Grid::new("wallet-stats").num_columns(4).show(ui, |ui| {
+                        ui.label(egui::RichText::new("wallet").small().strong());
+                        ui.label(egui::RichText::new("next nonce").small().strong());
+                        ui.label(egui::RichText::new("balance").small().strong());
+                        ui.label(egui::RichText::new("state").small().strong());
+                        ui.end_row();
+                        for w in &st.wallets {
+                            ui.label(egui::RichText::new(&w.label).small().monospace());
+                            ui.label(egui::RichText::new(w.next_nonce.to_string()).small());
+                            ui.label(
+                                egui::RichText::new(
+                                    w.balance_grains
+                                        .map(|g| format!("{} XUS", grains_to_xus(g)))
+                                        .unwrap_or_else(|| "—".into()),
+                                )
+                                .small(),
+                            );
+                            match &w.stopped {
+                                Some(why) => {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(200, 80, 80),
+                                        egui::RichText::new(format!("stopped: {why}")).small(),
+                                    );
+                                }
+                                None => {
+                                    ui.label(egui::RichText::new("firing").small().weak());
+                                }
+                            }
+                            ui.end_row();
+                        }
                     });
                 }
+
+                if !st.last_error.is_empty() {
+                    ui.colored_label(egui::Color32::from_rgb(200, 80, 80), &st.last_error);
+                }
+
+                ui.add_space(6.0);
+                ui.label("Per-tx log (newest last):");
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for line in &st.log {
+                            let mark = if line.ok { "OK " } else { "ERR" };
+                            let color = if line.ok {
+                                egui::Color32::from_rgb(90, 170, 90)
+                            } else {
+                                egui::Color32::from_rgb(200, 80, 80)
+                            };
+                            ui.horizontal(|ui| {
+                                ui.colored_label(color, mark);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "[{}] h{} n{} → {} · {} XUS · {}",
+                                        line.wallet,
+                                        line.height,
+                                        line.nonce,
+                                        line.to,
+                                        grains_to_xus(line.amount_grains),
+                                        line.detail
+                                    ))
+                                    .small()
+                                    .monospace(),
+                                );
+                            });
+                        }
+                    });
             });
         });
     }

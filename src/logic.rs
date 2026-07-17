@@ -3,24 +3,25 @@
 //! Everything the "TX cannon" decides before it touches the wire lives here so it
 //! can be unit-tested in isolation:
 //!   * [`NonceSequencer`] — strictly monotonic, gap-free, never-reused nonces,
-//!     reconciled against the node each block.
+//!     reconciled against the node and committed only when a nonce is consumed.
+//!   * [`Pacer`] — the Target-TX/s scheduler (cumulative-due, bounded catch-up).
+//!   * [`classify_reject`] + [`disposition`] — map the node's real rejection
+//!     strings to what the worker must do with the in-flight nonce.
+//!   * [`RateMeter`] — rolling per-second throughput window for the live meters.
 //!   * [`DestSelector`] — round-robin or random choice over the destination list.
 //!   * [`AmountMode`] — a fixed value or a uniform draw in `[min, max]` inclusive.
 //!   * [`build_signed_transfer`] — reuses the chain's real `SignedTransaction::sign`
 //!     (no reimplemented crypto) to produce a verifiable transfer.
-//!   * [`DecodedWallet`] / [`decode_keystore`] / [`merge_wallets`] — turn keystore
-//!     entries into spendable wallets keyed by the **seed-derived on-chain id**
-//!     (never the display label), deduplicated across merged keystore files.
 //!
-//! Secret hygiene: seeds decoded here go straight into `Zeroizing` buffers; the
-//! signing seed is otherwise passed in by the caller only for the duration of a
-//! single [`build_signed_transfer`] call. Nothing secret is retained or logged.
+//! None of this holds or logs secret material: the signing seed is passed in by
+//! the caller only for the duration of a single [`build_signed_transfer`] call.
+
+use std::collections::VecDeque;
+use std::time::Duration;
 
 use sov_crypto::Keypair;
 use sov_primitives::{AccountId, Balance};
-use sov_rpc::Keystore;
 use sov_types::{Action, SignedTransaction, Transaction};
-use zeroize::Zeroizing;
 
 /// A tiny, self-contained xorshift64\* PRNG.
 ///
@@ -104,9 +105,237 @@ impl NonceSequencer {
         n
     }
 
-    /// The nonce that would be handed out next (for display/tests).
+    /// The nonce that would be handed out next (for display/tests) — and the
+    /// nonce a continuous-mode worker BUILDS AT without yet consuming it.
     pub fn peek(&self) -> u64 {
         self.pending
+    }
+
+    /// Commit the peeked nonce: advance past it because the node has consumed
+    /// that slot (the tx was ACCEPTED, or was already pooled/mined). This is the
+    /// commit half of the continuous modes' peek → submit → commit flow; a
+    /// capacity rejection must NOT call this, so the same nonce is retried and
+    /// the account never develops a gap.
+    pub fn advance(&mut self) {
+        self.pending += 1;
+    }
+}
+
+/// How fast to fire.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RateMode {
+    /// Fire `n` transactions on each NEW block (the original behavior).
+    PerBlock(u32),
+    /// Pace submissions to approximate this many per second, decoupled from
+    /// blocks (see [`Pacer`]).
+    TargetTps(f64),
+    /// Submit as fast as sign+POST allows; the mempool's capacity rejections
+    /// are the only brake.
+    Firehose,
+}
+
+/// The Target-TX/s scheduler: given elapsed time since the run started, says how
+/// many submissions are due NOW.
+///
+/// It tracks the cumulative ideal count `floor(elapsed × tps)` and hands out the
+/// shortfall, capped at one second's worth per call so a stall (e.g. the app was
+/// blocked in a slow RPC) never produces a runaway catch-up burst — the skipped
+/// backlog is dropped, not replayed. With regular ticks the cumulative count
+/// tracks the ideal exactly (no starvation, even for fractional rates < 1).
+#[derive(Clone, Debug)]
+pub struct Pacer {
+    tps: f64,
+    issued: u64,
+}
+
+impl Pacer {
+    /// A pacer targeting `tps` submissions per second (must be > 0, enforced by
+    /// the UI's validation).
+    pub fn new(tps: f64) -> Self {
+        Self {
+            tps: tps.max(f64::MIN_POSITIVE),
+            issued: 0,
+        }
+    }
+
+    /// The most sends one call may return: one second's worth (min 1).
+    fn burst_cap(&self) -> u64 {
+        (self.tps.ceil() as u64).max(1)
+    }
+
+    /// How many submissions are due at `elapsed` since the run started. Advances
+    /// the internal cumulative counter; a backlog beyond [`burst_cap`] is
+    /// dropped (counted as issued) so there is never a runaway burst.
+    ///
+    /// [`burst_cap`]: Self::burst_cap
+    pub fn take_due(&mut self, elapsed: Duration) -> u64 {
+        let target = (elapsed.as_secs_f64() * self.tps) as u64;
+        let shortfall = target.saturating_sub(self.issued);
+        let due = shortfall.min(self.burst_cap());
+        // Mark the whole shortfall issued: what we don't send now is dropped,
+        // not deferred, so a stall can't snowball.
+        self.issued = self.issued.max(target);
+        due
+    }
+}
+
+/// What kind of rejection the node returned for a submit. Buckets mirror the
+/// live-meter breakdown: capacity / nonce / affordability / other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectClass {
+    /// The pool (or this sender's fair-share slice of it) is at capacity:
+    /// `"mempool is full (N transactions)"` or
+    /// `"sender S has reached its mempool limit of L pending transactions"`.
+    Capacity,
+    /// Our nonce is below the account's current nonce — our earlier txs mined
+    /// and the node moved ahead: `"stale transaction: account is at nonce C,
+    /// transaction used G"`.
+    NonceStale,
+    /// The nonce slot is already consumed in the pool (our earlier submit for
+    /// it landed): `"transaction already in the pool"` or `"a transaction with
+    /// signer S and nonce N is already pooled"`.
+    NonceOccupied,
+    /// The signer cannot afford it: `"insufficient balance: pooled transfers
+    /// would move C grains but only A are held"`.
+    Insufficient,
+    /// Anything else (unauthorized, invalid params, transport, …).
+    Other,
+}
+
+/// Classify a submit error by the node's REAL rejection strings (see
+/// `MempoolError` in `chain/crates/mempool` — the RPC wraps them as
+/// `"rejected: mempool rejected transaction: …"`, and the client as
+/// `"rpc error CODE: …"`; substring matching sees through both wrappers).
+/// Unrecognized messages land in [`RejectClass::Other`].
+pub fn classify_reject(msg: &str) -> RejectClass {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("mempool is full") || m.contains("reached its mempool limit") {
+        RejectClass::Capacity
+    } else if m.contains("stale transaction") {
+        RejectClass::NonceStale
+    } else if m.contains("already in the pool") || m.contains("already pooled") {
+        RejectClass::NonceOccupied
+    } else if m.contains("insufficient balance") {
+        RejectClass::Insufficient
+    } else {
+        RejectClass::Other
+    }
+}
+
+/// What the worker must do with its in-flight (peeked, not committed) nonce
+/// after a rejection. The rule that keeps the account gap-free: a nonce is
+/// committed ONLY when the node has consumed its slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// Hold the SAME nonce, back off briefly, retry (capacity: the slot was NOT
+    /// consumed — burning the nonce here would wedge the account).
+    HoldAndRetry,
+    /// The slot IS consumed (a duplicate of our own pooled tx) — commit and move
+    /// to the next nonce.
+    Advance,
+    /// The node is ahead of us (our txs mined) — re-query its next nonce and
+    /// reconcile the sequencer forward, without committing blindly.
+    ReconcileForward,
+    /// This wallet cannot afford further traffic — stop its run and surface why.
+    StopWallet,
+    /// Unknown failure: the slot was not provably consumed, so hold the nonce
+    /// (a later duplicate/stale answer resolves it), back off, keep going.
+    HoldAndRetryOther,
+}
+
+/// The disposition for each rejection class (pure, exhaustively tested).
+pub fn disposition(class: RejectClass) -> Disposition {
+    match class {
+        RejectClass::Capacity => Disposition::HoldAndRetry,
+        RejectClass::NonceStale => Disposition::ReconcileForward,
+        RejectClass::NonceOccupied => Disposition::Advance,
+        RejectClass::Insufficient => Disposition::StopWallet,
+        RejectClass::Other => Disposition::HoldAndRetryOther,
+    }
+}
+
+/// The event kinds the live meters track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeterKind {
+    /// A submission attempt (dry-run builds count too).
+    Attempted = 0,
+    /// The node accepted it (or dry-run built it).
+    Accepted = 1,
+    /// Rejected: pool/sender capacity.
+    RejCapacity = 2,
+    /// Rejected: nonce (stale or slot already pooled).
+    RejNonce = 3,
+    /// Rejected: affordability.
+    RejAfford = 4,
+    /// Rejected: anything else (incl. transport errors).
+    RejOther = 5,
+}
+
+/// Number of [`MeterKind`] variants.
+pub const METER_KINDS: usize = 6;
+
+/// A rolling per-second throughput meter over a short window of one-second
+/// buckets, plus cumulative totals. Time is caller-supplied milliseconds so it
+/// is deterministic under test; the GUI feeds it a monotonic clock.
+#[derive(Clone, Debug)]
+pub struct RateMeter {
+    window_secs: u64,
+    /// `(second, counts-per-kind)` buckets, oldest first, bounded to the window.
+    buckets: VecDeque<(u64, [u64; METER_KINDS])>,
+    totals: [u64; METER_KINDS],
+}
+
+impl RateMeter {
+    /// A meter averaging over the trailing `window_secs` (min 1) seconds.
+    pub fn new(window_secs: u64) -> Self {
+        Self {
+            window_secs: window_secs.max(1),
+            buckets: VecDeque::new(),
+            totals: [0; METER_KINDS],
+        }
+    }
+
+    fn prune(&mut self, now_sec: u64) {
+        while let Some(&(sec, _)) = self.buckets.front() {
+            if sec + self.window_secs <= now_sec {
+                self.buckets.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Record one event of `kind` at `now_ms`.
+    pub fn record(&mut self, now_ms: u64, kind: MeterKind) {
+        let sec = now_ms / 1000;
+        self.totals[kind as usize] += 1;
+        match self.buckets.back_mut() {
+            Some((s, counts)) if *s == sec => counts[kind as usize] += 1,
+            _ => {
+                let mut counts = [0u64; METER_KINDS];
+                counts[kind as usize] = 1;
+                self.buckets.push_back((sec, counts));
+            }
+        }
+        self.prune(sec);
+    }
+
+    /// Events-per-second of `kind` over the trailing window ending at `now_ms`.
+    pub fn rate(&self, now_ms: u64, kind: MeterKind) -> f64 {
+        let now_sec = now_ms / 1000;
+        let from = now_sec.saturating_sub(self.window_secs - 1);
+        let sum: u64 = self
+            .buckets
+            .iter()
+            .filter(|(s, _)| *s >= from && *s <= now_sec)
+            .map(|(_, c)| c[kind as usize])
+            .sum();
+        sum as f64 / self.window_secs as f64
+    }
+
+    /// Cumulative count of `kind` since the meter was created.
+    pub fn total(&self, kind: MeterKind) -> u64 {
+        self.totals[kind as usize]
     }
 }
 
@@ -223,105 +452,6 @@ impl KeyScheme {
             KeyScheme::Ed25519 => Keypair::from_seed(*seed),
             KeyScheme::Hybrid65 => Keypair::hybrid_from_seed(*seed),
         }
-    }
-}
-
-/// Derive the wallet's REAL on-chain account id from its signing seed — the
-/// implicit (key-derived) id, exactly as the node and SOV-Station compute it:
-/// `Keypair::{from_seed|hybrid_from_seed}(seed).public_key().implicit_account_id()`.
-///
-/// The keystore's `account` field is a DISPLAY LABEL, never an on-chain id;
-/// balances, nonces, and the tx `signer` must all use this derived id.
-pub fn derive_account_id(seed: &[u8; 32], scheme: KeyScheme) -> AccountId {
-    scheme
-        .keypair_from_seed(seed)
-        .public_key()
-        .implicit_account_id()
-    // The transient keypair drops here; the caller retains only the seed.
-}
-
-/// One spendable wallet decoded from a keystore entry.
-///
-/// `account` is always the seed-derived implicit id ([`derive_account_id`]);
-/// `label` is the keystore's human display string, shown alongside it in the UI.
-/// The seed lives in a `Zeroizing` buffer, wiped when the wallet drops.
-pub struct DecodedWallet {
-    pub label: String,
-    pub account: AccountId,
-    pub scheme: KeyScheme,
-    pub seed: Zeroizing<[u8; 32]>,
-}
-
-/// Decode a keystore's entries into spendable wallets keyed by their DERIVED
-/// on-chain id. Watch-only entries (no seed), undecodable seeds, and unknown
-/// schemes are skipped — they cannot sign. Transient seed copies are wiped.
-pub fn decode_keystore(ks: &Keystore) -> Vec<DecodedWallet> {
-    let mut out = Vec::new();
-    for (i, entry) in ks.miners.iter().enumerate() {
-        // Watch-only: empty seed, public key only. Cannot sign — skip.
-        if entry.seed_hex.trim().is_empty() {
-            continue;
-        }
-        let Ok(scheme) = KeyScheme::from_keystore(entry.scheme.as_deref()) else {
-            continue;
-        };
-        let Ok(mut seed_bytes) = hex::decode(entry.seed_hex.trim()) else {
-            continue;
-        };
-        let seed_arr: [u8; 32] = match seed_bytes.as_slice().try_into() {
-            Ok(a) => a,
-            Err(_) => {
-                wipe_bytes(&mut seed_bytes);
-                continue;
-            }
-        };
-        // Move the seed into a zeroizing buffer, then wipe the transient copy.
-        let seed = Zeroizing::new(seed_arr);
-        wipe_bytes(&mut seed_bytes);
-        // The REAL on-chain id comes from the seed, NOT the label.
-        let account = derive_account_id(&seed, scheme);
-        let label = if entry.account.trim().is_empty() {
-            format!("wallet #{i}")
-        } else {
-            entry.account.trim().to_string()
-        };
-        out.push(DecodedWallet {
-            label,
-            account,
-            scheme,
-            seed,
-        });
-    }
-    out
-}
-
-/// Merge `extra` wallets into `wallets`, deduplicating by DERIVED account id
-/// (the same key in two files is the same wallet, whatever its labels say).
-/// Duplicates drop here, wiping their `Zeroizing` seeds.
-pub fn merge_wallets(wallets: &mut Vec<DecodedWallet>, extra: Vec<DecodedWallet>) {
-    for w in extra {
-        if wallets.iter().any(|x| x.account == w.account) {
-            continue; // duplicate key → its Zeroizing seed wipes on drop
-        }
-        wallets.push(w);
-    }
-}
-
-/// Best-effort overwrite of a transient secret byte buffer before it is freed.
-fn wipe_bytes(v: &mut Vec<u8>) {
-    for b in v.iter_mut() {
-        *b = 0;
-    }
-    v.clear();
-}
-
-/// Short display form of an account id: `a35755d3…4c1e24`.
-pub fn short_account(a: &AccountId) -> String {
-    let s = a.as_str();
-    if s.len() > 16 {
-        format!("{}…{}", &s[..8], &s[s.len() - 6..])
-    } else {
-        s.to_string()
     }
 }
 
@@ -451,6 +581,287 @@ mod tests {
         seq.reconcile(3);
         let second: Vec<u64> = (0..3).map(|_| seq.next()).collect();
         assert_eq!(second, vec![3, 4, 5]);
+    }
+
+    // ---- Commit-on-accept nonce flow (continuous modes) -----------------
+
+    /// The scripted outcome of one simulated submit at the peeked nonce.
+    enum Sim {
+        Accept,
+        Reject(RejectClass),
+        /// Reject with the node's next nonce to reconcile against.
+        StaleWithNodeNonce(u64),
+    }
+
+    /// Drive the peek → submit → commit flow the continuous worker uses and
+    /// return every nonce actually SUBMITTED, in order.
+    fn drive(seq: &mut NonceSequencer, script: &[Sim]) -> Vec<u64> {
+        let mut submitted = Vec::new();
+        for step in script {
+            let nonce = seq.peek();
+            submitted.push(nonce); // build+sign+submit happens at the peeked nonce
+            match step {
+                Sim::Accept => seq.advance(),
+                Sim::StaleWithNodeNonce(node_next) => {
+                    assert_eq!(
+                        disposition(RejectClass::NonceStale),
+                        Disposition::ReconcileForward
+                    );
+                    seq.reconcile(*node_next);
+                }
+                Sim::Reject(class) => match disposition(*class) {
+                    Disposition::HoldAndRetry | Disposition::HoldAndRetryOther => {}
+                    Disposition::Advance => seq.advance(),
+                    Disposition::StopWallet => break,
+                    Disposition::ReconcileForward => unreachable!("use StaleWithNodeNonce"),
+                },
+            }
+        }
+        submitted
+    }
+
+    #[test]
+    fn advance_only_on_accept_keeps_the_stream_gap_free() {
+        let mut seq = NonceSequencer::new();
+        seq.reconcile(10);
+        let submitted = drive(
+            &mut seq,
+            &[
+                Sim::Accept,                             // 10 accepted
+                Sim::Reject(RejectClass::Capacity),      // 11 mempool-full → hold
+                Sim::Reject(RejectClass::Capacity),      // 11 again → hold
+                Sim::Accept,                             // 11 finally accepted
+                Sim::Reject(RejectClass::Other),         // 12 unknown → hold
+                Sim::Accept,                             // 12 accepted
+                Sim::Reject(RejectClass::NonceOccupied), // 13 already pooled → advance
+                Sim::Accept,                             // 14 accepted
+            ],
+        );
+        assert_eq!(submitted, vec![10, 11, 11, 11, 12, 12, 13, 14]);
+        // The COMMITTED sequence (unique nonces, in order) has no gap and no burn.
+        let mut committed = submitted.clone();
+        committed.dedup();
+        assert_eq!(committed, vec![10, 11, 12, 13, 14]);
+        assert_eq!(seq.peek(), 15);
+    }
+
+    #[test]
+    fn capacity_reject_never_burns_a_nonce() {
+        let mut seq = NonceSequencer::new();
+        seq.reconcile(0);
+        // 100 consecutive mempool-full rejections: the nonce must not move.
+        let submitted = drive(
+            &mut seq,
+            &(0..100)
+                .map(|_| Sim::Reject(RejectClass::Capacity))
+                .collect::<Vec<_>>(),
+        );
+        assert!(submitted.iter().all(|&n| n == 0));
+        assert_eq!(seq.peek(), 0);
+        // The moment capacity frees up, the SAME nonce goes through.
+        let after = drive(&mut seq, &[Sim::Accept]);
+        assert_eq!(after, vec![0]);
+        assert_eq!(seq.peek(), 1);
+    }
+
+    #[test]
+    fn stale_reject_reconciles_forward_to_the_node() {
+        let mut seq = NonceSequencer::new();
+        seq.reconcile(5);
+        // Our txs 5..8 mined while we were building 5 (stale view): the node now
+        // reports next nonce 8 — jump forward, continue gap-free from 8.
+        let submitted = drive(
+            &mut seq,
+            &[Sim::StaleWithNodeNonce(8), Sim::Accept, Sim::Accept],
+        );
+        assert_eq!(submitted, vec![5, 8, 9]);
+        assert_eq!(seq.peek(), 10);
+    }
+
+    #[test]
+    fn insufficient_stops_the_wallet() {
+        let mut seq = NonceSequencer::new();
+        seq.reconcile(3);
+        let submitted = drive(
+            &mut seq,
+            &[
+                Sim::Accept,
+                Sim::Reject(RejectClass::Insufficient),
+                Sim::Accept,
+            ],
+        );
+        // The run stops AT the affordability rejection; nothing fires after it.
+        assert_eq!(submitted, vec![3, 4]);
+        assert_eq!(seq.peek(), 4); // the rejected nonce was not consumed
+    }
+
+    // ---- Rejection classification (real node strings) --------------------
+
+    #[test]
+    fn classifies_the_nodes_real_rejection_strings() {
+        // Full client-visible wrapping: RpcClientError::Rpc → "rpc error CODE: "
+        // + RPC server → "rejected: " + NodeError::Mempool → "mempool rejected
+        // transaction: " + the MempoolError display strings.
+        let wrap = |inner: &str| {
+            format!("rpc error -32000: rejected: mempool rejected transaction: {inner}")
+        };
+
+        assert_eq!(
+            classify_reject(&wrap("mempool is full (16384 transactions)")),
+            RejectClass::Capacity
+        );
+        assert_eq!(
+            classify_reject(&wrap(
+                "sender 81f4ccaa has reached its mempool limit of 256 pending transactions"
+            )),
+            RejectClass::Capacity
+        );
+        assert_eq!(
+            classify_reject(&wrap(
+                "stale transaction: account is at nonce 12, transaction used 7"
+            )),
+            RejectClass::NonceStale
+        );
+        assert_eq!(
+            classify_reject(&wrap("transaction already in the pool")),
+            RejectClass::NonceOccupied
+        );
+        assert_eq!(
+            classify_reject(&wrap(
+                "a transaction with signer cannon.sov and nonce 9 is already pooled"
+            )),
+            RejectClass::NonceOccupied
+        );
+        assert_eq!(
+            classify_reject(&wrap(
+                "insufficient balance: pooled transfers would move 500 grains but only 100 are held"
+            )),
+            RejectClass::Insufficient
+        );
+        assert_eq!(
+            classify_reject(&wrap("invalid transaction signature")),
+            RejectClass::Other
+        );
+        // Non-mempool rejections and transport failures → the default bucket.
+        assert_eq!(
+            classify_reject(
+                "rpc error -32000: rejected: unauthorized: x.sov cannot be acted on by this key"
+            ),
+            RejectClass::Other
+        );
+        assert_eq!(
+            classify_reject("transport: Connection refused (os error 61)"),
+            RejectClass::Other
+        );
+    }
+
+    #[test]
+    fn dispositions_cover_every_class_correctly() {
+        assert_eq!(
+            disposition(RejectClass::Capacity),
+            Disposition::HoldAndRetry
+        );
+        assert_eq!(
+            disposition(RejectClass::NonceStale),
+            Disposition::ReconcileForward
+        );
+        assert_eq!(
+            disposition(RejectClass::NonceOccupied),
+            Disposition::Advance
+        );
+        assert_eq!(
+            disposition(RejectClass::Insufficient),
+            Disposition::StopWallet
+        );
+        assert_eq!(
+            disposition(RejectClass::Other),
+            Disposition::HoldAndRetryOther
+        );
+    }
+
+    // ---- Pacer (Target TX/s) ---------------------------------------------
+
+    #[test]
+    fn pacer_tracks_the_cumulative_target_over_regular_ticks() {
+        // 7 TX/s sampled every 100 ms for 3 s: cumulative issued must equal
+        // floor(elapsed × 7) at every tick — no runaway, no starvation.
+        let mut pacer = Pacer::new(7.0);
+        let mut issued = 0u64;
+        for tick in 1..=30u64 {
+            let elapsed = Duration::from_millis(tick * 100);
+            issued += pacer.take_due(elapsed);
+            let ideal = (elapsed.as_secs_f64() * 7.0) as u64;
+            assert_eq!(issued, ideal, "tick {tick}");
+        }
+        assert_eq!(issued, 21); // exactly 3 s × 7 TX/s
+    }
+
+    #[test]
+    fn pacer_sub_one_tps_is_not_starved() {
+        // 0.5 TX/s: exactly one send every 2 s, none before.
+        let mut pacer = Pacer::new(0.5);
+        assert_eq!(pacer.take_due(Duration::from_millis(500)), 0);
+        assert_eq!(pacer.take_due(Duration::from_millis(1999)), 0);
+        assert_eq!(pacer.take_due(Duration::from_millis(2000)), 1);
+        assert_eq!(pacer.take_due(Duration::from_millis(3900)), 0);
+        assert_eq!(pacer.take_due(Duration::from_millis(4000)), 1);
+    }
+
+    #[test]
+    fn pacer_caps_catchup_after_a_stall_and_drops_the_backlog() {
+        // 10 TX/s but the first tick comes after a 5 s stall: at most one
+        // second's worth (10) is due, and the missed 40 are dropped — the next
+        // regular tick issues only its incremental share.
+        let mut pacer = Pacer::new(10.0);
+        assert_eq!(pacer.take_due(Duration::from_secs(5)), 10);
+        assert_eq!(pacer.take_due(Duration::from_millis(5100)), 1);
+        assert_eq!(pacer.take_due(Duration::from_millis(5200)), 1);
+    }
+
+    #[test]
+    fn pacer_never_goes_backwards_or_double_issues() {
+        let mut pacer = Pacer::new(3.0);
+        assert_eq!(pacer.take_due(Duration::from_secs(1)), 3);
+        // The same instant again: nothing further is due.
+        assert_eq!(pacer.take_due(Duration::from_secs(1)), 0);
+        // A (nonsensical) earlier instant must not underflow or issue.
+        assert_eq!(pacer.take_due(Duration::from_millis(500)), 0);
+        assert_eq!(pacer.take_due(Duration::from_secs(2)), 3);
+    }
+
+    // ---- Rate meter -------------------------------------------------------
+
+    #[test]
+    fn meter_counts_rates_over_the_window_and_totals_forever() {
+        let mut m = RateMeter::new(5);
+        // 10 accepted events spread over seconds 0..=4 (2 per second).
+        for sec in 0..5u64 {
+            for i in 0..2u64 {
+                m.record(sec * 1000 + i * 100, MeterKind::Accepted);
+            }
+        }
+        let now = 4_900; // still inside second 4
+        assert_eq!(m.rate(now, MeterKind::Accepted), 2.0); // 10 events / 5 s
+        assert_eq!(m.total(MeterKind::Accepted), 10);
+        assert_eq!(m.rate(now, MeterKind::RejCapacity), 0.0);
+
+        // 10 seconds later the window is empty — rate decays to 0, totals stay.
+        let later = 15_000;
+        m.record(later, MeterKind::RejCapacity);
+        assert_eq!(m.rate(later, MeterKind::Accepted), 0.0);
+        assert_eq!(m.rate(later, MeterKind::RejCapacity), 1.0 / 5.0);
+        assert_eq!(m.total(MeterKind::Accepted), 10);
+        assert_eq!(m.total(MeterKind::RejCapacity), 1);
+    }
+
+    #[test]
+    fn meter_burst_in_one_second_averages_across_the_window() {
+        let mut m = RateMeter::new(5);
+        for _ in 0..50 {
+            m.record(10_000, MeterKind::Attempted); // 50 events in second 10
+        }
+        assert_eq!(m.rate(10_500, MeterKind::Attempted), 10.0); // 50 / 5 s
+        assert_eq!(m.total(MeterKind::Attempted), 50);
     }
 
     // ---- Destination selection -----------------------------------------
@@ -605,133 +1016,6 @@ mod tests {
             Ok(KeyScheme::Hybrid65)
         );
         assert!(KeyScheme::from_keystore(Some("dilithium")).is_err());
-    }
-
-    // ---- Account-id derivation (Bug 2 regression guards) -----------------
-
-    #[test]
-    fn derived_id_matches_the_node_derivation_and_is_not_the_label() {
-        // The exact path the node/SOV-Station uses for the default scheme:
-        // hybrid_from_seed(seed).public_key().implicit_account_id().
-        let seed = [7u8; 32];
-        let expected = Keypair::hybrid_from_seed(seed)
-            .public_key()
-            .implicit_account_id();
-        let got = derive_account_id(&seed, KeyScheme::Hybrid65);
-        assert_eq!(got, expected, "tool must derive the id the node derives");
-        // …and NEVER a display label.
-        assert_ne!(got, acct("my-wallet.sov"));
-        // The implicit id is 64 lowercase hex chars.
-        assert_eq!(got.as_str().len(), 64);
-        assert!(got.as_str().chars().all(|c| c.is_ascii_hexdigit()));
-
-        // Ed25519 scheme follows its own derivation and differs from hybrid.
-        let ed_expected = Keypair::from_seed(seed).public_key().implicit_account_id();
-        let ed_got = derive_account_id(&seed, KeyScheme::Ed25519);
-        assert_eq!(ed_got, ed_expected);
-        assert_ne!(ed_got, got, "schemes must derive distinct ids");
-    }
-
-    #[test]
-    fn keystore_wallets_are_keyed_by_derived_id_not_label() {
-        // Entries whose `account` fields are LABELS (what SOV-Station saves).
-        let seed_a = [1u8; 32];
-        let seed_b = [2u8; 32];
-        let ks = Keystore {
-            miners: vec![
-                sov_rpc::KeystoreEntry {
-                    account: "my-wallet".into(), // display label, NOT an id
-                    seed_hex: hex::encode(seed_a),
-                    scheme: Some("hybrid65".into()),
-                    mnemonic: None,
-                    public_key: None,
-                },
-                sov_rpc::KeystoreEntry {
-                    account: "legacy".into(),
-                    seed_hex: hex::encode(seed_b),
-                    scheme: None, // absent = ed25519, matching the node
-                    mnemonic: None,
-                    public_key: None,
-                },
-                // Watch-only: no seed → must be skipped, cannot sign.
-                sov_rpc::KeystoreEntry {
-                    account: "watch".into(),
-                    seed_hex: String::new(),
-                    scheme: Some("hybrid65".into()),
-                    mnemonic: None,
-                    public_key: Some("hybrid65:0xdead".into()),
-                },
-            ],
-        };
-        let wallets = decode_keystore(&ks);
-        assert_eq!(wallets.len(), 2, "watch-only entries are skipped");
-
-        let expect_a = Keypair::hybrid_from_seed(seed_a)
-            .public_key()
-            .implicit_account_id();
-        let expect_b = Keypair::from_seed(seed_b)
-            .public_key()
-            .implicit_account_id();
-        assert_eq!(wallets[0].account, expect_a);
-        assert_eq!(wallets[1].account, expect_b);
-        // The labels survive for display but are NOT the account.
-        assert_eq!(wallets[0].label, "my-wallet");
-        assert_eq!(wallets[1].label, "legacy");
-        assert_ne!(wallets[0].account.as_str(), "my-wallet");
-        assert_ne!(wallets[1].account.as_str(), "legacy");
-        // And the retained seed still signs as that derived account.
-        let stx = build_signed_transfer(
-            &wallets[0].seed,
-            wallets[0].scheme,
-            &wallets[0].account,
-            &acct("target.sov"),
-            1,
-            0,
-        )
-        .unwrap();
-        assert!(stx.verify_signature());
-        assert_eq!(stx.transaction.signer, expect_a);
-    }
-
-    #[test]
-    fn merging_keystores_dedups_by_derived_id() {
-        let seed_a = [9u8; 32];
-        let seed_b = [10u8; 32];
-        let entry = |label: &str, seed: [u8; 32]| sov_rpc::KeystoreEntry {
-            account: label.into(),
-            seed_hex: hex::encode(seed),
-            scheme: Some("hybrid65".into()),
-            mnemonic: None,
-            public_key: None,
-        };
-        // Auto-store has A; the backup has the SAME key under a different label
-        // plus a genuinely different key B.
-        let auto = Keystore {
-            miners: vec![entry("main", seed_a)],
-        };
-        let backup = Keystore {
-            miners: vec![entry("main-backup-copy", seed_a), entry("second", seed_b)],
-        };
-        let mut wallets = decode_keystore(&auto);
-        merge_wallets(&mut wallets, decode_keystore(&backup));
-        assert_eq!(wallets.len(), 2, "same key must appear once");
-        assert_eq!(wallets[0].label, "main", "first-seen label wins");
-        assert_eq!(
-            wallets[1].account,
-            Keypair::hybrid_from_seed(seed_b)
-                .public_key()
-                .implicit_account_id()
-        );
-    }
-
-    #[test]
-    fn short_account_abbreviates_long_ids_only() {
-        let long = derive_account_id(&[4u8; 32], KeyScheme::Hybrid65);
-        let short = short_account(&long);
-        assert!(short.len() < long.as_str().len());
-        assert!(short.contains('…'));
-        assert!(long.as_str().starts_with(&short[..8]));
-        assert_eq!(short_account(&acct("bob.sov")), "bob.sov");
     }
 
     // ---- Amount parsing -------------------------------------------------
