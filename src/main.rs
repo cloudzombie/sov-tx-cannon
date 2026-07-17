@@ -184,6 +184,24 @@ impl Default for Status {
     }
 }
 
+/// Persistent node-connection state, refreshed ~every 2s by a keyless monitor
+/// thread that runs for the app's WHOLE life (independent of any firing session) —
+/// so the connection indicator is live the moment the app opens, not only while
+/// firing. Holds no key material.
+#[derive(Default)]
+struct Conn {
+    /// Whether ANY probe has completed yet (so the UI can show "connecting…").
+    ever: bool,
+    /// Whether the last probe reached the node.
+    ok: bool,
+    /// Last observed chain tip height.
+    tip: u64,
+    /// Last observed mempool depth.
+    mempool: Option<u64>,
+    /// The error text from the last failed probe (empty when ok).
+    error: String,
+}
+
 impl Status {
     fn push_log(&mut self, line: LogLine) {
         self.log.push(line);
@@ -279,6 +297,14 @@ struct CannonApp {
     // Live run.
     status: Arc<Mutex<Status>>,
     session: Option<Session>,
+
+    // Always-on connection monitor (independent of firing). `conn_addr` is shared
+    // so UI edits to `rpc_addr` reach the monitor; the monitor is spawned lazily on
+    // the first `update` (it needs the egui Context to request repaints).
+    conn: Arc<Mutex<Conn>>,
+    conn_addr: Arc<Mutex<String>>,
+    conn_stop: Arc<AtomicBool>,
+    conn_started: bool,
 }
 
 impl Default for CannonApp {
@@ -302,6 +328,10 @@ impl Default for CannonApp {
             config_msg: String::new(),
             status: Arc::new(Mutex::new(Status::default())),
             session: None,
+            conn: Arc::new(Mutex::new(Conn::default())),
+            conn_addr: Arc::new(Mutex::new(DEFAULT_RPC.to_string())),
+            conn_stop: Arc::new(AtomicBool::new(false)),
+            conn_started: false,
         }
     }
 }
@@ -621,6 +651,8 @@ impl Drop for CannonApp {
         if let Some(mut s) = self.session.take() {
             s.stop_and_join();
         }
+        // Signal the always-on connection monitor to exit (keyless; detached).
+        self.conn_stop.store(true, Ordering::SeqCst);
         self.wipe_wallets();
         self.passphrase.zeroize();
     }
@@ -654,6 +686,41 @@ fn run_monitor(
         }
         ctx.request_repaint();
         sleep_interruptible(&stop, Duration::from_secs(1));
+    }
+}
+
+/// Persistent connection monitor: probes the node's tip height + mempool depth
+/// every ~2s for the app's whole life, so the connection indicator is live from the
+/// moment the app opens (not only while firing). Re-reads the RPC address each loop
+/// so editing it takes effect. Holds NO key material.
+fn run_conn_monitor(
+    conn: Arc<Mutex<Conn>>,
+    addr: Arc<Mutex<String>>,
+    stop: Arc<AtomicBool>,
+    ctx: eframe::egui::Context,
+) {
+    while !stop.load(Ordering::SeqCst) {
+        let a = addr.lock().map(|s| s.clone()).unwrap_or_default();
+        let client = RpcClient::new(a).with_timeout(Duration::from_secs(3));
+        let height = client.height();
+        let depth = client.mempool_size().ok();
+        if let Ok(mut c) = conn.lock() {
+            c.ever = true;
+            match height {
+                Ok(h) => {
+                    c.ok = true;
+                    c.tip = h;
+                    c.mempool = depth.map(|d| d as u64);
+                    c.error.clear();
+                }
+                Err(e) => {
+                    c.ok = false;
+                    c.error = format!("{e}");
+                }
+            }
+        }
+        ctx.request_repaint();
+        sleep_interruptible(&stop, Duration::from_secs(2));
     }
 }
 
@@ -1094,6 +1161,24 @@ impl eframe::App for CannonApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         use eframe::egui;
 
+        // Spawn the always-on connection monitor once (it needs the egui Context).
+        if !self.conn_started {
+            self.conn_started = true;
+            let (conn, addr, stop, ctx2) = (
+                self.conn.clone(),
+                self.conn_addr.clone(),
+                self.conn_stop.clone(),
+                ctx.clone(),
+            );
+            thread::spawn(move || run_conn_monitor(conn, addr, stop, ctx2));
+        }
+        // Propagate the current RPC address to the monitor (so edits take effect).
+        if let Ok(mut a) = self.conn_addr.lock() {
+            if *a != self.rpc_addr {
+                *a = self.rpc_addr.clone();
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("SOV TX Cannon");
@@ -1104,6 +1189,32 @@ impl eframe::App for CannonApp {
                     .small()
                     .weak(),
                 );
+                ui.add_space(6.0);
+
+                // ---- Always-on connection indicator -------------------------
+                {
+                    let green = egui::Color32::from_rgb(90, 190, 110);
+                    let red = egui::Color32::from_rgb(220, 80, 80);
+                    let (color, text) = match self.conn.lock() {
+                        Ok(c) if !c.ever => (
+                            egui::Color32::GRAY,
+                            format!("○ connecting to {}…", self.rpc_addr),
+                        ),
+                        Ok(c) if c.ok => {
+                            let mp = c
+                                .mempool
+                                .map(|d| format!(" · mempool {d}/{MEMPOOL_CAP_HINT}"))
+                                .unwrap_or_default();
+                            (green, format!("● Connected — tip {}{mp}", c.tip))
+                        }
+                        Ok(c) => (
+                            red,
+                            format!("● Can't reach node at {}: {}", self.rpc_addr, c.error),
+                        ),
+                        Err(_) => (red, "● connection state unavailable".to_string()),
+                    };
+                    ui.colored_label(color, egui::RichText::new(text).strong());
+                }
                 ui.add_space(8.0);
 
                 let running = self.is_running();
