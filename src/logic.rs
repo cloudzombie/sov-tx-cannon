@@ -8,13 +8,19 @@
 //!   * [`AmountMode`] — a fixed value or a uniform draw in `[min, max]` inclusive.
 //!   * [`build_signed_transfer`] — reuses the chain's real `SignedTransaction::sign`
 //!     (no reimplemented crypto) to produce a verifiable transfer.
+//!   * [`DecodedWallet`] / [`decode_keystore`] / [`merge_wallets`] — turn keystore
+//!     entries into spendable wallets keyed by the **seed-derived on-chain id**
+//!     (never the display label), deduplicated across merged keystore files.
 //!
-//! None of this holds or logs secret material: the signing seed is passed in by
-//! the caller only for the duration of a single [`build_signed_transfer`] call.
+//! Secret hygiene: seeds decoded here go straight into `Zeroizing` buffers; the
+//! signing seed is otherwise passed in by the caller only for the duration of a
+//! single [`build_signed_transfer`] call. Nothing secret is retained or logged.
 
 use sov_crypto::Keypair;
 use sov_primitives::{AccountId, Balance};
+use sov_rpc::Keystore;
 use sov_types::{Action, SignedTransaction, Transaction};
+use zeroize::Zeroizing;
 
 /// A tiny, self-contained xorshift64\* PRNG.
 ///
@@ -217,6 +223,105 @@ impl KeyScheme {
             KeyScheme::Ed25519 => Keypair::from_seed(*seed),
             KeyScheme::Hybrid65 => Keypair::hybrid_from_seed(*seed),
         }
+    }
+}
+
+/// Derive the wallet's REAL on-chain account id from its signing seed — the
+/// implicit (key-derived) id, exactly as the node and SOV-Station compute it:
+/// `Keypair::{from_seed|hybrid_from_seed}(seed).public_key().implicit_account_id()`.
+///
+/// The keystore's `account` field is a DISPLAY LABEL, never an on-chain id;
+/// balances, nonces, and the tx `signer` must all use this derived id.
+pub fn derive_account_id(seed: &[u8; 32], scheme: KeyScheme) -> AccountId {
+    scheme
+        .keypair_from_seed(seed)
+        .public_key()
+        .implicit_account_id()
+    // The transient keypair drops here; the caller retains only the seed.
+}
+
+/// One spendable wallet decoded from a keystore entry.
+///
+/// `account` is always the seed-derived implicit id ([`derive_account_id`]);
+/// `label` is the keystore's human display string, shown alongside it in the UI.
+/// The seed lives in a `Zeroizing` buffer, wiped when the wallet drops.
+pub struct DecodedWallet {
+    pub label: String,
+    pub account: AccountId,
+    pub scheme: KeyScheme,
+    pub seed: Zeroizing<[u8; 32]>,
+}
+
+/// Decode a keystore's entries into spendable wallets keyed by their DERIVED
+/// on-chain id. Watch-only entries (no seed), undecodable seeds, and unknown
+/// schemes are skipped — they cannot sign. Transient seed copies are wiped.
+pub fn decode_keystore(ks: &Keystore) -> Vec<DecodedWallet> {
+    let mut out = Vec::new();
+    for (i, entry) in ks.miners.iter().enumerate() {
+        // Watch-only: empty seed, public key only. Cannot sign — skip.
+        if entry.seed_hex.trim().is_empty() {
+            continue;
+        }
+        let Ok(scheme) = KeyScheme::from_keystore(entry.scheme.as_deref()) else {
+            continue;
+        };
+        let Ok(mut seed_bytes) = hex::decode(entry.seed_hex.trim()) else {
+            continue;
+        };
+        let seed_arr: [u8; 32] = match seed_bytes.as_slice().try_into() {
+            Ok(a) => a,
+            Err(_) => {
+                wipe_bytes(&mut seed_bytes);
+                continue;
+            }
+        };
+        // Move the seed into a zeroizing buffer, then wipe the transient copy.
+        let seed = Zeroizing::new(seed_arr);
+        wipe_bytes(&mut seed_bytes);
+        // The REAL on-chain id comes from the seed, NOT the label.
+        let account = derive_account_id(&seed, scheme);
+        let label = if entry.account.trim().is_empty() {
+            format!("wallet #{i}")
+        } else {
+            entry.account.trim().to_string()
+        };
+        out.push(DecodedWallet {
+            label,
+            account,
+            scheme,
+            seed,
+        });
+    }
+    out
+}
+
+/// Merge `extra` wallets into `wallets`, deduplicating by DERIVED account id
+/// (the same key in two files is the same wallet, whatever its labels say).
+/// Duplicates drop here, wiping their `Zeroizing` seeds.
+pub fn merge_wallets(wallets: &mut Vec<DecodedWallet>, extra: Vec<DecodedWallet>) {
+    for w in extra {
+        if wallets.iter().any(|x| x.account == w.account) {
+            continue; // duplicate key → its Zeroizing seed wipes on drop
+        }
+        wallets.push(w);
+    }
+}
+
+/// Best-effort overwrite of a transient secret byte buffer before it is freed.
+fn wipe_bytes(v: &mut Vec<u8>) {
+    for b in v.iter_mut() {
+        *b = 0;
+    }
+    v.clear();
+}
+
+/// Short display form of an account id: `a35755d3…4c1e24`.
+pub fn short_account(a: &AccountId) -> String {
+    let s = a.as_str();
+    if s.len() > 16 {
+        format!("{}…{}", &s[..8], &s[s.len() - 6..])
+    } else {
+        s.to_string()
     }
 }
 
@@ -500,6 +605,133 @@ mod tests {
             Ok(KeyScheme::Hybrid65)
         );
         assert!(KeyScheme::from_keystore(Some("dilithium")).is_err());
+    }
+
+    // ---- Account-id derivation (Bug 2 regression guards) -----------------
+
+    #[test]
+    fn derived_id_matches_the_node_derivation_and_is_not_the_label() {
+        // The exact path the node/SOV-Station uses for the default scheme:
+        // hybrid_from_seed(seed).public_key().implicit_account_id().
+        let seed = [7u8; 32];
+        let expected = Keypair::hybrid_from_seed(seed)
+            .public_key()
+            .implicit_account_id();
+        let got = derive_account_id(&seed, KeyScheme::Hybrid65);
+        assert_eq!(got, expected, "tool must derive the id the node derives");
+        // …and NEVER a display label.
+        assert_ne!(got, acct("my-wallet.sov"));
+        // The implicit id is 64 lowercase hex chars.
+        assert_eq!(got.as_str().len(), 64);
+        assert!(got.as_str().chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Ed25519 scheme follows its own derivation and differs from hybrid.
+        let ed_expected = Keypair::from_seed(seed).public_key().implicit_account_id();
+        let ed_got = derive_account_id(&seed, KeyScheme::Ed25519);
+        assert_eq!(ed_got, ed_expected);
+        assert_ne!(ed_got, got, "schemes must derive distinct ids");
+    }
+
+    #[test]
+    fn keystore_wallets_are_keyed_by_derived_id_not_label() {
+        // Entries whose `account` fields are LABELS (what SOV-Station saves).
+        let seed_a = [1u8; 32];
+        let seed_b = [2u8; 32];
+        let ks = Keystore {
+            miners: vec![
+                sov_rpc::KeystoreEntry {
+                    account: "my-wallet".into(), // display label, NOT an id
+                    seed_hex: hex::encode(seed_a),
+                    scheme: Some("hybrid65".into()),
+                    mnemonic: None,
+                    public_key: None,
+                },
+                sov_rpc::KeystoreEntry {
+                    account: "legacy".into(),
+                    seed_hex: hex::encode(seed_b),
+                    scheme: None, // absent = ed25519, matching the node
+                    mnemonic: None,
+                    public_key: None,
+                },
+                // Watch-only: no seed → must be skipped, cannot sign.
+                sov_rpc::KeystoreEntry {
+                    account: "watch".into(),
+                    seed_hex: String::new(),
+                    scheme: Some("hybrid65".into()),
+                    mnemonic: None,
+                    public_key: Some("hybrid65:0xdead".into()),
+                },
+            ],
+        };
+        let wallets = decode_keystore(&ks);
+        assert_eq!(wallets.len(), 2, "watch-only entries are skipped");
+
+        let expect_a = Keypair::hybrid_from_seed(seed_a)
+            .public_key()
+            .implicit_account_id();
+        let expect_b = Keypair::from_seed(seed_b)
+            .public_key()
+            .implicit_account_id();
+        assert_eq!(wallets[0].account, expect_a);
+        assert_eq!(wallets[1].account, expect_b);
+        // The labels survive for display but are NOT the account.
+        assert_eq!(wallets[0].label, "my-wallet");
+        assert_eq!(wallets[1].label, "legacy");
+        assert_ne!(wallets[0].account.as_str(), "my-wallet");
+        assert_ne!(wallets[1].account.as_str(), "legacy");
+        // And the retained seed still signs as that derived account.
+        let stx = build_signed_transfer(
+            &wallets[0].seed,
+            wallets[0].scheme,
+            &wallets[0].account,
+            &acct("target.sov"),
+            1,
+            0,
+        )
+        .unwrap();
+        assert!(stx.verify_signature());
+        assert_eq!(stx.transaction.signer, expect_a);
+    }
+
+    #[test]
+    fn merging_keystores_dedups_by_derived_id() {
+        let seed_a = [9u8; 32];
+        let seed_b = [10u8; 32];
+        let entry = |label: &str, seed: [u8; 32]| sov_rpc::KeystoreEntry {
+            account: label.into(),
+            seed_hex: hex::encode(seed),
+            scheme: Some("hybrid65".into()),
+            mnemonic: None,
+            public_key: None,
+        };
+        // Auto-store has A; the backup has the SAME key under a different label
+        // plus a genuinely different key B.
+        let auto = Keystore {
+            miners: vec![entry("main", seed_a)],
+        };
+        let backup = Keystore {
+            miners: vec![entry("main-backup-copy", seed_a), entry("second", seed_b)],
+        };
+        let mut wallets = decode_keystore(&auto);
+        merge_wallets(&mut wallets, decode_keystore(&backup));
+        assert_eq!(wallets.len(), 2, "same key must appear once");
+        assert_eq!(wallets[0].label, "main", "first-seen label wins");
+        assert_eq!(
+            wallets[1].account,
+            Keypair::hybrid_from_seed(seed_b)
+                .public_key()
+                .implicit_account_id()
+        );
+    }
+
+    #[test]
+    fn short_account_abbreviates_long_ids_only() {
+        let long = derive_account_id(&[4u8; 32], KeyScheme::Hybrid65);
+        let short = short_account(&long);
+        assert!(short.len() < long.as_str().len());
+        assert!(short.contains('…'));
+        assert!(long.as_str().starts_with(&short[..8]));
+        assert_eq!(short_account(&acct("bob.sov")), "bob.sov");
     }
 
     // ---- Amount parsing -------------------------------------------------
