@@ -317,6 +317,12 @@ struct CannonApp {
     // Live run.
     status: Arc<Mutex<Status>>,
     session: Option<Session>,
+    /// Background threads joining a stopped session's workers (so Stop never blocks
+    /// the UI thread on an in-flight RPC). Reaped when finished; joined on exit.
+    draining: Vec<thread::JoinHandle<()>>,
+    /// Closed-loop mode: fire ONLY to the unlocked wallets' own addresses, so every
+    /// XUS stays among the user's accounts (nothing can be sent to a foreign key).
+    recycle: bool,
 
     // Always-on connection monitor (independent of firing). `conn_addr` is shared
     // so UI edits to `rpc_addr` reach the monitor; the monitor is spawned lazily on
@@ -348,6 +354,8 @@ impl Default for CannonApp {
             config_msg: String::new(),
             status: Arc::new(Mutex::new(Status::default())),
             session: None,
+            draining: Vec::new(),
+            recycle: true, // default: closed-loop, no XUS can leave the user's wallets
             conn: Arc::new(Mutex::new(Conn::default())),
             conn_addr: Arc::new(Mutex::new(DEFAULT_RPC.to_string())),
             conn_stop: Arc::new(AtomicBool::new(false)),
@@ -480,6 +488,19 @@ impl CannonApp {
 
     /// Parse the destination textarea into validated account ids.
     fn parse_dests(&self) -> Result<Vec<AccountId>, String> {
+        // Closed-loop: destinations are the unlocked wallets' OWN addresses, so every
+        // XUS stays among the user's accounts — nothing can be sent to a key the user
+        // doesn't hold. (Worst case is a self-send, which merely pays the miner fee to
+        // the user's own miner; no XUS is ever lost.)
+        if self.recycle {
+            let mine: Vec<AccountId> = self.wallets.iter().map(|w| w.account.clone()).collect();
+            if mine.is_empty() {
+                return Err(
+                    "unlock your wallets first — recycle sends XUS among your own accounts".into(),
+                );
+            }
+            return Ok(mine);
+        }
         let mut out = Vec::new();
         for (n, raw) in self.dests_text.lines().enumerate() {
             let s = raw.trim();
@@ -666,11 +687,18 @@ impl CannonApp {
         self.session = Some(Session { stop, handles });
     }
 
-    /// Stop firing: halt ALL workers and join them (each worker's seed copy is
-    /// zeroized as its config drops) before returning.
+    /// Stop firing. Signals every worker immediately, then joins them on a
+    /// BACKGROUND thread so an in-flight submit/read can never freeze the UI. Each
+    /// worker's seed copy is still zeroized as its config drops when the worker exits;
+    /// the join thread is tracked in `draining` (reaped in `update`, joined on exit)
+    /// so the wipe is always completed.
     fn stop(&mut self) {
-        if let Some(mut s) = self.session.take() {
-            s.stop_and_join();
+        if let Some(s) = self.session.take() {
+            s.stop.store(true, Ordering::SeqCst); // halt workers now
+            self.draining.push(thread::spawn(move || {
+                let mut s = s;
+                s.stop_and_join();
+            }));
         }
         if let Ok(mut st) = self.status.lock() {
             st.running = false;
@@ -684,6 +712,10 @@ impl Drop for CannonApp {
         // Ensure every worker's seed copy is wiped, then wipe ours.
         if let Some(mut s) = self.session.take() {
             s.stop_and_join();
+        }
+        // Wait out any background stop-joins so their workers' seeds finish wiping.
+        for h in self.draining.drain(..) {
+            let _ = h.join();
         }
         // Signal the always-on connection monitor to exit (keyless; detached).
         self.conn_stop.store(true, Ordering::SeqCst);
@@ -708,7 +740,7 @@ fn run_monitor(
     stop: Arc<AtomicBool>,
     ctx: eframe::egui::Context,
 ) {
-    let client = RpcClient::new(rpc_addr).with_timeout(Duration::from_secs(5));
+    let client = RpcClient::new(rpc_addr).with_timeout(Duration::from_secs(4));
     while !stop.load(Ordering::SeqCst) {
         let height = client.height().ok();
         let depth = client.mempool_size().ok();
@@ -808,7 +840,10 @@ fn run_worker(
         }
     };
     let mut ws = WorkerState {
-        client: RpcClient::new(cfg.rpc_addr.clone()).with_timeout(Duration::from_secs(15)),
+        // Short timeout: a worker blocked in a submit/read is what a background Stop
+        // join has to wait out, so keep it small (a slow/saturated node must never
+        // make Stop feel hung).
+        client: RpcClient::new(cfg.rpc_addr.clone()).with_timeout(Duration::from_secs(4)),
         selector,
         rng: Rng::from_entropy(),
         seq: NonceSequencer::new(),
@@ -1212,6 +1247,8 @@ impl eframe::App for CannonApp {
                 *a = self.rpc_addr.clone();
             }
         }
+        // Reap finished background stop-join threads.
+        self.draining.retain(|h| !h.is_finished());
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1347,14 +1384,36 @@ impl eframe::App for CannonApp {
                     egui::CollapsingHeader::new("3 · Configure traffic")
                         .default_open(true)
                         .show(ui, |ui| {
-                            ui.label("Destinations (one account id per line):");
-                            ui.add_enabled(
-                                !running,
-                                egui::TextEdit::multiline(&mut self.dests_text)
-                                    .hint_text("alice.sov\nbob.sov\ncarol.sov")
-                                    .desired_rows(4)
-                                    .desired_width(f32::INFINITY),
-                            );
+                            ui.add_enabled_ui(!running, |ui| {
+                                ui.checkbox(
+                                    &mut self.recycle,
+                                    "♻ Recycle to my own wallets (closed loop — no XUS can leave)",
+                                )
+                                .on_hover_text(
+                                    "Destinations become your unlocked wallets' own addresses, so \
+                                     every XUS circulates among YOUR accounts. Only the miner fee \
+                                     moves — to your own miner. Nothing can be sent to a key you \
+                                     don't hold. Uncheck only to send to addresses you type below.",
+                                );
+                            });
+                            if self.recycle {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "→ firing among your unlocked wallets; nothing leaves your control.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            } else {
+                                ui.label("Destinations (one account id per line):");
+                                ui.add_enabled(
+                                    !running,
+                                    egui::TextEdit::multiline(&mut self.dests_text)
+                                        .hint_text("alice.sov\nbob.sov\ncarol.sov")
+                                        .desired_rows(4)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            }
                             ui.add_enabled_ui(!running, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label("Pick destination:");
