@@ -1,0 +1,37 @@
+[package]
+name = "sov-tx-cannon"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Automated transaction traffic generator for SOV: watches the chain tip and fires signed transfers each new block, from a SOV-Station wallet the user unlocks."
+
+# Standalone tool — intentionally NOT a member of the chain workspace, so it never
+# affects `chain/` builds, tests, or CI. It depends on the real chain crates by path
+# (the same keystore decryption, signing, ids, and RPC client SOV-Station uses — no
+# reimplemented crypto anywhere in this crate).
+[[bin]]
+name = "sov-tx-cannon"
+path = "src/main.rs"
+
+[dependencies]
+sov-rpc = { path = "../../chain/crates/rpc" }
+sov-crypto = { path = "../../chain/crates/crypto" }
+sov-types = { path = "../../chain/crates/types" }
+sov-primitives = { path = "../../chain/crates/primitives" }
+# Native GUI — the same immediate-mode stack as SOV-Station.
+eframe = "0.29"
+# Memory hygiene: passphrase and signing seeds wiped on drop.
+zeroize = "1"
+# OS entropy for the random destination / random amount modes.
+getrandom = "0.2"
+# Decoding the keystore's hex seed fields (matches the workspace's hex version).
+hex = "0.4"
+
+[dev-dependencies]
+# The unit tests assert a built+signed tx round-trips through the same Borsh
+# codec the chain uses; pinned to the workspace's version via the types crate.
+borsh = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
