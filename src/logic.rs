@@ -460,6 +460,18 @@ impl KeyScheme {
 /// The seed is used only to derive a transient [`Keypair`] for this one signature.
 /// Returns the signed transaction, whose signature is guaranteed to verify (the
 /// public key committed in the tx is the one that signed it).
+/// The on-chain (implicit) account id for a wallet `seed` under `scheme`, derived
+/// EXACTLY as the node/SOV-Station does: the implicit id of the derived public key.
+/// The keystore's `account` field is only a DISPLAY LABEL — never the on-chain id —
+/// so balance/nonce queries and the tx `signer` MUST use this, not the label.
+pub fn derive_account_id(seed: &[u8; 32], scheme: KeyScheme) -> AccountId {
+    scheme
+        .keypair_from_seed(seed)
+        .public_key()
+        .implicit_account_id()
+    // The transient keypair drops here; the caller keeps only the seed.
+}
+
 pub fn build_signed_transfer(
     seed: &[u8; 32],
     scheme: KeyScheme,
@@ -951,6 +963,29 @@ mod tests {
     }
 
     // ---- Tx construction + signing -------------------------------------
+
+    #[test]
+    fn derived_id_matches_node_derivation_and_is_not_the_label() {
+        let seed = [9u8; 32];
+        // Matches the node's rule exactly for both schemes.
+        for scheme in [KeyScheme::Hybrid65, KeyScheme::Ed25519] {
+            let got = derive_account_id(&seed, scheme);
+            let want = scheme
+                .keypair_from_seed(&seed)
+                .public_key()
+                .implicit_account_id();
+            assert_eq!(got, want);
+            // A 64-hex implicit id — never a human label like "my-wallet".
+            assert_eq!(got.as_str().len(), 64);
+            assert!(got.as_str().chars().all(|c| c.is_ascii_hexdigit()));
+            assert_ne!(got.as_str(), "my-wallet");
+        }
+        // The two schemes derive DIFFERENT ids from the same seed.
+        assert_ne!(
+            derive_account_id(&seed, KeyScheme::Hybrid65),
+            derive_account_id(&seed, KeyScheme::Ed25519)
+        );
+    }
 
     #[test]
     fn built_transfer_verifies_and_has_correct_fields() {

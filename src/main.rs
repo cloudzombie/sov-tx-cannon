@@ -43,9 +43,9 @@ use sov_primitives::AccountId;
 use sov_rpc::{Keystore, RpcClient};
 
 use logic::{
-    build_signed_transfer, classify_reject, disposition, grains_to_xus, parse_xus, AmountMode,
-    DestMode, DestSelector, Disposition, KeyScheme, MeterKind, NonceSequencer, Pacer, RateMeter,
-    RateMode, RejectClass, Rng,
+    build_signed_transfer, classify_reject, derive_account_id, disposition, grains_to_xus,
+    parse_xus, AmountMode, DestMode, DestSelector, Disposition, KeyScheme, MeterKind,
+    NonceSequencer, Pacer, RateMeter, RateMode, RejectClass, Rng,
 };
 
 /// Default node RPC endpoint (SOV-Station's node default).
@@ -113,18 +113,38 @@ struct UnlockedWallet {
     fire: bool,
 }
 
-/// The keystore path: `~/.sov-station/wallets.keystore` (same file SOV-Station
-/// writes). Kept overridable in the UI for non-default installs.
-fn default_keystore_path() -> String {
+/// Just the filename of a store path, for compact unlock messages.
+fn short_path(p: &str) -> String {
+    std::path::Path::new(p)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.to_string())
+}
+
+/// A file under `~/.sov-station/`.
+fn sov_station_file(name: &str) -> String {
     let home = std::env::var("HOME")
         .ok()
         .or_else(|| std::env::var("USERPROFILE").ok())
         .unwrap_or_default();
     PathBuf::from(home)
         .join(".sov-station")
-        .join("wallets.keystore")
+        .join(name)
         .to_string_lossy()
         .into_owned()
+}
+
+/// The PRIMARY wallet store: `~/.sov-station/wallets.auto` — the store SOV-Station
+/// auto-loads on launch under the MASTER passphrase (NOT `wallets.keystore`, which
+/// is a manual export/backup and often has its own passphrase). Overridable in the UI.
+fn default_keystore_path() -> String {
+    sov_station_file("wallets.auto")
+}
+
+/// The manual export/backup store — merged in on unlock if it decrypts with the same
+/// master passphrase (so a user who kept a same-passphrase backup sees those too).
+fn backup_keystore_path() -> String {
+    sov_station_file("wallets.keystore")
 }
 
 /// A single line in the live per-tx log.
@@ -341,9 +361,13 @@ impl CannonApp {
         self.session.is_some()
     }
 
-    /// Read + decrypt SOV-Station's keystore with the typed passphrase, load the
-    /// spendable wallets, then WIPE the passphrase. Watch-only entries (no seed)
-    /// are skipped — they cannot sign.
+    /// Decrypt SOV-Station's wallet store(s) with the master passphrase and load the
+    /// spendable wallets, then WIPE the passphrase. Reads a CANDIDATE list — the UI
+    /// path (default `wallets.auto`, SOV-Station's primary store) plus `wallets.auto`
+    /// and the `wallets.keystore` backup — and MERGES them, deduping by the DERIVED
+    /// on-chain id. Each wallet's on-chain account is derived from its SEED
+    /// ([`derive_account_id`]); the keystore's `account` field is only a display
+    /// label. Watch-only entries (no seed) are skipped — they cannot sign.
     fn unlock(&mut self) {
         if self.is_running() {
             return;
@@ -352,78 +376,88 @@ impl CannonApp {
             self.unlock_msg = "enter your master passphrase".into();
             return;
         }
-        let text = match std::fs::read_to_string(&self.keystore_path) {
-            Ok(t) => t,
-            Err(e) => {
-                self.unlock_msg = format!("cannot read keystore: {e}");
-                return;
+
+        // Candidate stores, deduped: the UI path first, then the two default stores.
+        let mut candidates = vec![self.keystore_path.trim().to_string()];
+        for extra in [default_keystore_path(), backup_keystore_path()] {
+            if !candidates.contains(&extra) {
+                candidates.push(extra);
             }
-        };
-        // Reuse SOV-Station's exact hardened decryption (Argon2id + ChaCha20-Poly1305).
-        let ks = match Keystore::from_encrypted_or_plain(&text, Some(self.passphrase.as_str())) {
-            Ok(ks) => ks,
-            Err(e) => {
-                self.unlock_msg = format!("unlock failed: {e}");
-                self.passphrase.zeroize();
-                return;
-            }
-        };
+        }
 
         // Drop any previously unlocked wallets first (zeroizes their seeds).
         self.wipe_wallets();
-        for (i, entry) in ks.miners.iter().enumerate() {
-            // Skip watch-only entries: empty seed, public key present.
-            if entry.seed_hex.trim().is_empty() {
-                continue;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut notes: Vec<String> = Vec::new();
+        for path in &candidates {
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(_) => continue, // missing store — skip silently
+            };
+            // Reuse SOV-Station's exact hardened decryption (Argon2id + ChaCha20-Poly1305).
+            let ks = match Keystore::from_encrypted_or_plain(&text, Some(self.passphrase.as_str()))
+            {
+                Ok(ks) => ks,
+                Err(_) => {
+                    notes.push(format!(
+                        "{}: wrong passphrase / not readable",
+                        short_path(path)
+                    ));
+                    continue;
+                }
+            };
+            for (i, entry) in ks.miners.iter().enumerate() {
+                if entry.seed_hex.trim().is_empty() {
+                    continue; // watch-only: no seed to sign with
+                }
+                let scheme = match KeyScheme::from_keystore(entry.scheme.as_deref()) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let mut seed_bytes = match hex::decode(entry.seed_hex.trim()) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let seed_arr: [u8; 32] = match seed_bytes.as_slice().try_into() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        wipe_vec(&mut seed_bytes);
+                        continue;
+                    }
+                };
+                let mut seed = Zeroizing::new(seed_arr);
+                wipe_vec(&mut seed_bytes);
+                // The REAL on-chain id — derived from the seed, NOT the label field.
+                let account = derive_account_id(&seed, scheme);
+                if !seen.insert(account.to_string()) {
+                    *seed = [0u8; 32]; // duplicate across stores — wipe + skip
+                    continue;
+                }
+                let label = if entry.account.trim().is_empty() {
+                    format!("wallet #{i}")
+                } else {
+                    entry.account.trim().to_string()
+                };
+                let fire = self.wallets.is_empty(); // default: first wallet only
+                self.wallets.push(UnlockedWallet {
+                    label,
+                    account,
+                    scheme,
+                    seed,
+                    balance_grains: None,
+                    fire,
+                });
             }
-            let scheme = match KeyScheme::from_keystore(entry.scheme.as_deref()) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let mut seed_bytes = match hex::decode(entry.seed_hex.trim()) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let seed_arr: [u8; 32] = match seed_bytes.as_slice().try_into() {
-                Ok(a) => a,
-                Err(_) => {
-                    wipe_vec(&mut seed_bytes);
-                    continue;
-                }
-            };
-            // Move the seed into a zeroizing buffer, then wipe the transient copy.
-            let mut seed = Zeroizing::new(seed_arr);
-            wipe_vec(&mut seed_bytes);
-            let account = match AccountId::new(entry.account.trim()) {
-                Ok(a) => a,
-                Err(_) => {
-                    // Wipe the seed we just built before discarding it.
-                    *seed = [0u8; 32];
-                    continue;
-                }
-            };
-            let label = if entry.account.trim().is_empty() {
-                format!("wallet #{i}")
-            } else {
-                entry.account.trim().to_string()
-            };
-            self.wallets.push(UnlockedWallet {
-                label,
-                account,
-                scheme,
-                seed,
-                balance_grains: None,
-                // Default: only the first wallet fires (the simple single-wallet
-                // case); the user opts additional wallets in via the checklist.
-                fire: self.wallets.is_empty(),
-            });
         }
         // The passphrase has done its job; wipe it from memory now.
         self.passphrase.zeroize();
 
         if self.wallets.is_empty() {
-            self.unlock_msg =
-                "unlocked, but no spendable wallets found (watch-only or empty keystore)".into();
+            self.unlock_msg = if notes.is_empty() {
+                "no spendable wallets found (watch-only or empty store)".into()
+            } else {
+                format!("unlock failed — {}", notes.join("; "))
+            };
         } else {
             self.unlock_msg = format!("unlocked {} wallet(s)", self.wallets.len());
             self.refresh_balances();
