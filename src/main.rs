@@ -370,7 +370,7 @@ impl Default for CannonApp {
             status: Arc::new(Mutex::new(Status::default())),
             session: None,
             draining: Vec::new(),
-            recycle: true, // default: closed-loop, no XUS can leave the user's wallets
+            recycle: true, // default: closed-loop — principal recycles among the user's wallets
             conn: Arc::new(Mutex::new(Conn::default())),
             conn_addr: Arc::new(Mutex::new(DEFAULT_RPC.to_string())),
             conn_stop: Arc::new(AtomicBool::new(false)),
@@ -503,10 +503,10 @@ impl CannonApp {
 
     /// Parse the destination textarea into validated account ids.
     fn parse_dests(&self) -> Result<Vec<AccountId>, String> {
-        // Closed-loop: destinations are the unlocked wallets' OWN addresses, so every
-        // XUS stays among the user's accounts — nothing can be sent to a key the user
-        // doesn't hold. (Worst case is a self-send, which merely pays the miner fee to
-        // the user's own miner; no XUS is ever lost.)
+        // Closed-loop: destinations are the unlocked wallets' OWN addresses, so the
+        // principal stays among the user's accounts — nothing can be sent to a key the
+        // user doesn't hold. Each tx still pays its miner fee (~21,000 grains), which
+        // consensus routes to whoever mines the block — a third party on mainnet.
         if self.recycle {
             let mine: Vec<AccountId> = self.wallets.iter().map(|w| w.account.clone()).collect();
             if mine.is_empty() {
@@ -1468,19 +1468,20 @@ impl eframe::App for CannonApp {
                             ui.add_enabled_ui(!running, |ui| {
                                 ui.checkbox(
                                     &mut self.recycle,
-                                    "♻ Recycle to my own wallets (closed loop — no XUS can leave)",
+                                    "♻ Recycle to my own wallets (closed loop — principal recycles among your wallets)",
                                 )
                                 .on_hover_text(
                                     "Destinations become your unlocked wallets' own addresses, so \
-                                     every XUS circulates among YOUR accounts. Only the miner fee \
-                                     moves — to your own miner. Nothing can be sent to a key you \
-                                     don't hold. Uncheck only to send to addresses you type below.",
+                                     the principal circulates among YOUR accounts. Each tx still \
+                                     pays its miner fee (~0.00021 XUS) to whoever mines the block. \
+                                     Nothing can be sent to a key you don't hold. Uncheck only to \
+                                     send to addresses you type below.",
                                 );
                             });
                             if self.recycle {
                                 ui.label(
                                     egui::RichText::new(
-                                        "→ firing among your unlocked wallets; nothing leaves your control.",
+                                        "→ firing among your unlocked wallets; principal stays with you (each tx still pays its miner fee).",
                                     )
                                     .small()
                                     .weak(),
