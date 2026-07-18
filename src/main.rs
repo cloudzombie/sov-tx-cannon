@@ -71,6 +71,10 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const CAPACITY_BACKOFF: Duration = Duration::from_millis(200);
 /// Back-off after an unclassified submit failure (transport, unknown reject).
 const OTHER_BACKOFF: Duration = Duration::from_millis(500);
+/// Back-off while the balance is fully committed by still-pending txs (the refire
+/// -after-Stop state): long enough not to spam the node, short enough to resume
+/// within a few seconds of the backlog mining out.
+const AFFORD_BACKOFF: Duration = Duration::from_secs(4);
 /// The node's default mempool capacity (display hint for the saturation flag;
 /// the node remains the authority — its "mempool is full" rejections are what
 /// actually gate submission).
@@ -1060,19 +1064,27 @@ fn fire_once(
     let amount = cfg.amount_mode.pick(&mut ws.rng);
     let nonce = ws.seq.peek();
 
-    // Local affordability pre-check (the node's mempool is the real gate).
+    // Local affordability pre-check (the node's mempool is the real gate). A shortfall
+    // is NOT fatal: pending txs from a previous run release the balance as they mine
+    // (closed-loop recycle returns it outright) — refresh from the node and wait.
     if let Some(bal) = ws.known_balance {
         if bal < amount.saturating_add(FEE_ESTIMATE_GRAINS) {
-            let detail = format!(
-                "insufficient balance ({} XUS) for {} XUS + fee — stopping this wallet",
-                grains_to_xus(bal),
-                grains_to_xus(amount)
-            );
-            record(status, MeterKind::RejAfford);
-            log_tx(status, cfg, ws.height, &to, amount, nonce, false, &detail);
-            set_error(status, &format!("{}: {detail}", cfg.label));
-            publish_wallet_stat(cfg, ws, status, Some(detail));
-            return FireResult::Stop;
+            if let Ok(fresh) = ws.client.balance(&cfg.from) {
+                ws.known_balance = Some(fresh.grains());
+            }
+            if ws
+                .known_balance
+                .is_some_and(|b| b < amount.saturating_add(FEE_ESTIMATE_GRAINS))
+            {
+                let detail = format!(
+                    "balance {} XUS can't cover {} XUS + fee — waiting for pending txs to mine",
+                    grains_to_xus(ws.known_balance.unwrap_or(0)),
+                    grains_to_xus(amount)
+                );
+                record(status, MeterKind::RejAfford);
+                publish_wallet_stat(cfg, ws, status, Some(detail));
+                return FireResult::Backoff(AFFORD_BACKOFF);
+            }
         }
     }
 
@@ -1162,6 +1174,24 @@ fn fire_once(
                     }
                     publish_wallet_stat(cfg, ws, status, None);
                     FireResult::Continue
+                }
+                Disposition::WaitAffordable => {
+                    // The pool holds earlier txs committing this balance (typically a
+                    // previous run's backlog). Refresh our view, hold the nonce, wait —
+                    // firing resumes by itself as blocks mine the backlog out.
+                    if let Ok(fresh) = ws.client.balance(&cfg.from) {
+                        ws.known_balance = Some(fresh.grains());
+                    }
+                    if let Ok(n) = ws.client.nonce(&cfg.from) {
+                        ws.seq.reconcile(n);
+                    }
+                    publish_wallet_stat(
+                        cfg,
+                        ws,
+                        status,
+                        Some("waiting for pending txs to mine (balance committed)".into()),
+                    );
+                    FireResult::Backoff(AFFORD_BACKOFF)
                 }
                 Disposition::StopWallet => {
                     set_error(status, &format!("{}: {msg}", cfg.label));

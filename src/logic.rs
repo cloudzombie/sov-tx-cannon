@@ -236,6 +236,12 @@ pub enum Disposition {
     /// The node is ahead of us (our txs mined) — re-query its next nonce and
     /// reconcile the sequencer forward, without committing blindly.
     ReconcileForward,
+    /// The signer's balance is fully committed (typically the PREVIOUS run's txs
+    /// still pending in the pool). It frees as they mine — and in closed-loop
+    /// recycle it comes straight back — so hold the nonce, wait, re-check. This is
+    /// what makes a refire after Stop self-heal instead of instantly killing every
+    /// worker while the old run's mempool backlog drains.
+    WaitAffordable,
     /// This wallet cannot afford further traffic — stop its run and surface why.
     StopWallet,
     /// Unknown failure: the slot was not provably consumed, so hold the nonce
@@ -249,7 +255,7 @@ pub fn disposition(class: RejectClass) -> Disposition {
         RejectClass::Capacity => Disposition::HoldAndRetry,
         RejectClass::NonceStale => Disposition::ReconcileForward,
         RejectClass::NonceOccupied => Disposition::Advance,
-        RejectClass::Insufficient => Disposition::StopWallet,
+        RejectClass::Insufficient => Disposition::WaitAffordable,
         RejectClass::Other => Disposition::HoldAndRetryOther,
     }
 }
@@ -622,7 +628,9 @@ mod tests {
                     seq.reconcile(*node_next);
                 }
                 Sim::Reject(class) => match disposition(*class) {
-                    Disposition::HoldAndRetry | Disposition::HoldAndRetryOther => {}
+                    Disposition::HoldAndRetry
+                    | Disposition::HoldAndRetryOther
+                    | Disposition::WaitAffordable => {}
                     Disposition::Advance => seq.advance(),
                     Disposition::StopWallet => break,
                     Disposition::ReconcileForward => unreachable!("use StaleWithNodeNonce"),
@@ -691,7 +699,10 @@ mod tests {
     }
 
     #[test]
-    fn insufficient_stops_the_wallet() {
+    fn insufficient_waits_and_recovers_holding_the_nonce() {
+        // The refire-after-Stop scenario: the previous run's pending txs still
+        // commit the balance, the node rejects with "insufficient", and the
+        // worker must HOLD the nonce and continue once balance frees — never die.
         let mut seq = NonceSequencer::new();
         seq.reconcile(3);
         let submitted = drive(
@@ -702,9 +713,9 @@ mod tests {
                 Sim::Accept,
             ],
         );
-        // The run stops AT the affordability rejection; nothing fires after it.
-        assert_eq!(submitted, vec![3, 4]);
-        assert_eq!(seq.peek(), 4); // the rejected nonce was not consumed
+        // The affordability rejection holds nonce 4; the next accept fires it.
+        assert_eq!(submitted, vec![3, 4, 4]);
+        assert_eq!(seq.peek(), 5);
     }
 
     // ---- Rejection classification (real node strings) --------------------
@@ -783,7 +794,7 @@ mod tests {
         );
         assert_eq!(
             disposition(RejectClass::Insufficient),
-            Disposition::StopWallet
+            Disposition::WaitAffordable
         );
         assert_eq!(
             disposition(RejectClass::Other),
