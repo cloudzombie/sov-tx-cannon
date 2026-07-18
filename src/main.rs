@@ -220,7 +220,18 @@ struct Conn {
     mempool: Option<u64>,
     /// The error text from the last failed probe (empty when ok).
     error: String,
+    /// When the last SUCCESSFUL probe completed — the heartbeat. The indicator
+    /// only shows green while this is fresh, so a wedged monitor or dead node can
+    /// never leave a stale "Connected" on screen.
+    beat_at: Option<Instant>,
+    /// Round-trip time of the last successful probe.
+    latency_ms: u64,
 }
+
+/// How old the last successful heartbeat may be and still count as "Connected".
+/// One probe cycle is ~2s + a worst case bounded 3s connect/read, so anything
+/// older than this means beats are genuinely being missed.
+const HEARTBEAT_FRESH: Duration = Duration::from_secs(7);
 
 impl Status {
     fn push_log(&mut self, line: LogLine) {
@@ -768,8 +779,10 @@ fn run_conn_monitor(
     while !stop.load(Ordering::SeqCst) {
         let a = addr.lock().map(|s| s.clone()).unwrap_or_default();
         let client = RpcClient::new(a).with_timeout(Duration::from_secs(3));
+        let probe_started = Instant::now();
         let height = client.height();
-        let depth = client.mempool_size().ok();
+        let latency = probe_started.elapsed();
+        let depth = height.is_ok().then(|| client.mempool_size().ok()).flatten();
         if let Ok(mut c) = conn.lock() {
             c.ever = true;
             match height {
@@ -778,6 +791,8 @@ fn run_conn_monitor(
                     c.tip = h;
                     c.mempool = depth.map(|d| d as u64);
                     c.error.clear();
+                    c.beat_at = Some(Instant::now());
+                    c.latency_ms = latency.as_millis() as u64;
                 }
                 Err(e) => {
                     c.ok = false;
@@ -1262,29 +1277,65 @@ impl eframe::App for CannonApp {
                 );
                 ui.add_space(6.0);
 
-                // ---- Always-on connection indicator -------------------------
+                // ---- Always-on connection indicator (real heartbeat) --------
+                // Green is EARNED, never assumed: it requires a successful probe
+                // within HEARTBEAT_FRESH. A monitor that stops beating goes amber;
+                // a failing probe goes red — both with the age of the last beat.
                 {
                     let green = egui::Color32::from_rgb(90, 190, 110);
+                    let amber = egui::Color32::from_rgb(230, 175, 60);
                     let red = egui::Color32::from_rgb(220, 80, 80);
                     let (color, text) = match self.conn.lock() {
                         Ok(c) if !c.ever => (
                             egui::Color32::GRAY,
                             format!("○ connecting to {}…", self.rpc_addr),
                         ),
-                        Ok(c) if c.ok => {
-                            let mp = c
-                                .mempool
-                                .map(|d| format!(" · mempool {d}/{MEMPOOL_CAP_HINT}"))
-                                .unwrap_or_default();
-                            (green, format!("● Connected — tip {}{mp}", c.tip))
+                        Ok(c) => {
+                            let age = c.beat_at.map(|t| t.elapsed());
+                            match age {
+                                Some(age) if c.ok && age < HEARTBEAT_FRESH => {
+                                    let mp = c
+                                        .mempool
+                                        .map(|d| format!(" · mempool {d}/{MEMPOOL_CAP_HINT}"))
+                                        .unwrap_or_default();
+                                    (
+                                        green,
+                                        format!(
+                                            "● Connected — tip {}{mp} · ♥ {}ms",
+                                            c.tip, c.latency_ms
+                                        ),
+                                    )
+                                }
+                                Some(age) if c.ok => (
+                                    amber,
+                                    format!(
+                                        "● Heartbeat stalled — last beat {}s ago (tip {})",
+                                        age.as_secs(),
+                                        c.tip
+                                    ),
+                                ),
+                                _ => {
+                                    let seen = c
+                                        .beat_at
+                                        .map(|t| {
+                                            format!(" · last beat {}s ago", t.elapsed().as_secs())
+                                        })
+                                        .unwrap_or_default();
+                                    (
+                                        red,
+                                        format!(
+                                            "● Can't reach node at {}: {}{seen}",
+                                            self.rpc_addr, c.error
+                                        ),
+                                    )
+                                }
+                            }
                         }
-                        Ok(c) => (
-                            red,
-                            format!("● Can't reach node at {}: {}", self.rpc_addr, c.error),
-                        ),
                         Err(_) => (red, "● connection state unavailable".to_string()),
                     };
                     ui.colored_label(color, egui::RichText::new(text).strong());
+                    // Keep the beat age ticking even when idle (cheap 1 Hz repaint).
+                    ctx.request_repaint_after(Duration::from_secs(1));
                 }
                 ui.add_space(8.0);
 
