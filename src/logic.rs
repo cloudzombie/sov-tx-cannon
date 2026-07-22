@@ -129,6 +129,13 @@ pub enum RateMode {
     /// Pace submissions to approximate this many per second, decoupled from
     /// blocks (see [`Pacer`]).
     TargetTps(f64),
+    /// Begin at `start_tps` and grow linearly to `max_tps` over `ramp_secs`,
+    /// then keep pulsing at the ceiling until stopped.
+    Pulse {
+        start_tps: f64,
+        max_tps: f64,
+        ramp_secs: f64,
+    },
     /// Submit as fast as sign+POST allows; the mempool's capacity rejections
     /// are the only brake.
     Firehose,
@@ -144,7 +151,9 @@ pub enum RateMode {
 /// tracks the ideal exactly (no starvation, even for fractional rates < 1).
 #[derive(Clone, Debug)]
 pub struct Pacer {
-    tps: f64,
+    start_tps: f64,
+    max_tps: f64,
+    ramp_secs: f64,
     issued: u64,
 }
 
@@ -152,15 +161,42 @@ impl Pacer {
     /// A pacer targeting `tps` submissions per second (must be > 0, enforced by
     /// the UI's validation).
     pub fn new(tps: f64) -> Self {
+        Self::growing(tps, tps, 1.0)
+    }
+
+    /// A continuously growing pacer. The instantaneous rate rises linearly from
+    /// `start_tps` to `max_tps` during `ramp_secs`, then remains at the ceiling.
+    pub fn growing(start_tps: f64, max_tps: f64, ramp_secs: f64) -> Self {
+        let start_tps = start_tps.max(f64::MIN_POSITIVE);
+        let max_tps = max_tps.max(start_tps);
         Self {
-            tps: tps.max(f64::MIN_POSITIVE),
+            start_tps,
+            max_tps,
+            ramp_secs: ramp_secs.max(f64::MIN_POSITIVE),
             issued: 0,
         }
     }
 
+    /// Integral of the configured rate curve: total transactions that should
+    /// have been issued by `elapsed`.
+    fn target(&self, elapsed: Duration) -> u64 {
+        let t = elapsed.as_secs_f64();
+        let ramp_t = t.min(self.ramp_secs);
+        let slope = (self.max_tps - self.start_tps) / self.ramp_secs;
+        let during_ramp = self.start_tps * ramp_t + 0.5 * slope * ramp_t * ramp_t;
+        let after_ramp = (t - self.ramp_secs).max(0.0) * self.max_tps;
+        (during_ramp + after_ramp) as u64
+    }
+
+    /// Instantaneous target rate at `elapsed`, used to bound catch-up bursts.
+    fn current_tps(&self, elapsed: Duration) -> f64 {
+        let progress = (elapsed.as_secs_f64() / self.ramp_secs).clamp(0.0, 1.0);
+        self.start_tps + (self.max_tps - self.start_tps) * progress
+    }
+
     /// The most sends one call may return: one second's worth (min 1).
-    fn burst_cap(&self) -> u64 {
-        (self.tps.ceil() as u64).max(1)
+    fn burst_cap(&self, elapsed: Duration) -> u64 {
+        (self.current_tps(elapsed).ceil() as u64).max(1)
     }
 
     /// How many submissions are due at `elapsed` since the run started. Advances
@@ -169,9 +205,9 @@ impl Pacer {
     ///
     /// [`burst_cap`]: Self::burst_cap
     pub fn take_due(&mut self, elapsed: Duration) -> u64 {
-        let target = (elapsed.as_secs_f64() * self.tps) as u64;
+        let target = self.target(elapsed);
         let shortfall = target.saturating_sub(self.issued);
-        let due = shortfall.min(self.burst_cap());
+        let due = shortfall.min(self.burst_cap(elapsed));
         // Mark the whole shortfall issued: what we don't send now is dropped,
         // not deferred, so a stall can't snowball.
         self.issued = self.issued.max(target);
