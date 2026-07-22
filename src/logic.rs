@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use sov_crypto::Keypair;
-use sov_primitives::{AccountId, Balance};
+use sov_primitives::{AccountId, Balance, SigningDomain};
 use sov_types::{Action, SignedTransaction, Transaction};
 
 /// A tiny, self-contained xorshift64\* PRNG.
@@ -129,13 +129,6 @@ pub enum RateMode {
     /// Pace submissions to approximate this many per second, decoupled from
     /// blocks (see [`Pacer`]).
     TargetTps(f64),
-    /// Begin at `start_tps` and grow linearly to `max_tps` over `ramp_secs`,
-    /// then keep pulsing at the ceiling until stopped.
-    Pulse {
-        start_tps: f64,
-        max_tps: f64,
-        ramp_secs: f64,
-    },
     /// Submit as fast as sign+POST allows; the mempool's capacity rejections
     /// are the only brake.
     Firehose,
@@ -151,9 +144,7 @@ pub enum RateMode {
 /// tracks the ideal exactly (no starvation, even for fractional rates < 1).
 #[derive(Clone, Debug)]
 pub struct Pacer {
-    start_tps: f64,
-    max_tps: f64,
-    ramp_secs: f64,
+    tps: f64,
     issued: u64,
 }
 
@@ -161,42 +152,15 @@ impl Pacer {
     /// A pacer targeting `tps` submissions per second (must be > 0, enforced by
     /// the UI's validation).
     pub fn new(tps: f64) -> Self {
-        Self::growing(tps, tps, 1.0)
-    }
-
-    /// A continuously growing pacer. The instantaneous rate rises linearly from
-    /// `start_tps` to `max_tps` during `ramp_secs`, then remains at the ceiling.
-    pub fn growing(start_tps: f64, max_tps: f64, ramp_secs: f64) -> Self {
-        let start_tps = start_tps.max(f64::MIN_POSITIVE);
-        let max_tps = max_tps.max(start_tps);
         Self {
-            start_tps,
-            max_tps,
-            ramp_secs: ramp_secs.max(f64::MIN_POSITIVE),
+            tps: tps.max(f64::MIN_POSITIVE),
             issued: 0,
         }
     }
 
-    /// Integral of the configured rate curve: total transactions that should
-    /// have been issued by `elapsed`.
-    fn target(&self, elapsed: Duration) -> u64 {
-        let t = elapsed.as_secs_f64();
-        let ramp_t = t.min(self.ramp_secs);
-        let slope = (self.max_tps - self.start_tps) / self.ramp_secs;
-        let during_ramp = self.start_tps * ramp_t + 0.5 * slope * ramp_t * ramp_t;
-        let after_ramp = (t - self.ramp_secs).max(0.0) * self.max_tps;
-        (during_ramp + after_ramp) as u64
-    }
-
-    /// Instantaneous target rate at `elapsed`, used to bound catch-up bursts.
-    fn current_tps(&self, elapsed: Duration) -> f64 {
-        let progress = (elapsed.as_secs_f64() / self.ramp_secs).clamp(0.0, 1.0);
-        self.start_tps + (self.max_tps - self.start_tps) * progress
-    }
-
     /// The most sends one call may return: one second's worth (min 1).
-    fn burst_cap(&self, elapsed: Duration) -> u64 {
-        (self.current_tps(elapsed).ceil() as u64).max(1)
+    fn burst_cap(&self) -> u64 {
+        (self.tps.ceil() as u64).max(1)
     }
 
     /// How many submissions are due at `elapsed` since the run started. Advances
@@ -205,9 +169,9 @@ impl Pacer {
     ///
     /// [`burst_cap`]: Self::burst_cap
     pub fn take_due(&mut self, elapsed: Duration) -> u64 {
-        let target = self.target(elapsed);
+        let target = (elapsed.as_secs_f64() * self.tps) as u64;
         let shortfall = target.saturating_sub(self.issued);
-        let due = shortfall.min(self.burst_cap(elapsed));
+        let due = shortfall.min(self.burst_cap());
         // Mark the whole shortfall issued: what we don't send now is dropped,
         // not deferred, so a stall can't snowball.
         self.issued = self.issued.max(target);
@@ -514,6 +478,10 @@ pub fn derive_account_id(seed: &[u8; 32], scheme: KeyScheme) -> AccountId {
     // The transient keypair drops here; the caller keeps only the seed.
 }
 
+/// `domain` is the network [`SigningDomain`] from the node's
+/// `sov_getSigningDomain` (`RpcClient::signing_domain`): `None` while the
+/// `tx-domain` fork is dormant (legacy signature, byte-identical to before),
+/// `Some(domain)` once active (network-bound signature).
 pub fn build_signed_transfer(
     seed: &[u8; 32],
     scheme: KeyScheme,
@@ -521,6 +489,7 @@ pub fn build_signed_transfer(
     to: &AccountId,
     amount_grains: u128,
     nonce: u64,
+    domain: Option<&SigningDomain>,
 ) -> Result<SignedTransaction, String> {
     let keypair = scheme.keypair_from_seed(seed);
     let tx = Transaction {
@@ -532,7 +501,7 @@ pub fn build_signed_transfer(
             amount: Balance::from_grains(amount_grains),
         },
     };
-    SignedTransaction::sign(tx, &keypair).map_err(|e| format!("signing failed: {e}"))
+    SignedTransaction::sign_in(tx, &keypair, domain).map_err(|e| format!("signing failed: {e}"))
     // `keypair` drops here.
 }
 
@@ -1040,7 +1009,8 @@ mod tests {
         let seed = [7u8; 32];
         let from = acct("cannon.sov");
         let to = acct("target.sov");
-        let stx = build_signed_transfer(&seed, KeyScheme::Ed25519, &from, &to, 42_000, 9).unwrap();
+        let stx =
+            build_signed_transfer(&seed, KeyScheme::Ed25519, &from, &to, 42_000, 9, None).unwrap();
 
         // Signature verifies against the committed public key.
         assert!(stx.verify_signature(), "signature must verify");
@@ -1061,6 +1031,31 @@ mod tests {
     }
 
     #[test]
+    fn domain_bound_transfer_verifies_only_under_its_domain() {
+        use sov_primitives::Hash;
+        let seed = [7u8; 32];
+        let from = acct("cannon.sov");
+        let to = acct("target.sov");
+        let domain = SigningDomain::new("sov-mainnet", Hash::digest(b"g"));
+        let bound = build_signed_transfer(
+            &seed,
+            KeyScheme::Ed25519,
+            &from,
+            &to,
+            42_000,
+            9,
+            Some(&domain),
+        )
+        .unwrap();
+        assert!(bound.verify_signature_in(Some(&domain)));
+        assert!(!bound.verify_signature(), "bound sig must NOT pass legacy");
+        // The tx id is domain-independent (hash of the un-framed body).
+        let legacy =
+            build_signed_transfer(&seed, KeyScheme::Ed25519, &from, &to, 42_000, 9, None).unwrap();
+        assert_eq!(bound.id(), legacy.id());
+    }
+
+    #[test]
     fn built_transfer_round_trips_through_borsh_and_still_verifies() {
         let seed = [3u8; 32];
         let stx = build_signed_transfer(
@@ -1070,6 +1065,7 @@ mod tests {
             &acct("target.sov"),
             1,
             0,
+            None,
         )
         .unwrap();
         let bytes = borsh::to_vec(&stx).unwrap();

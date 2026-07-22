@@ -12,8 +12,6 @@
 //!   * **Per block** — on each NEW chain tip, fire N transactions (the original
 //!     behavior).
 //!   * **Target TX/s** — a steady paced rate decoupled from blocks.
-//!   * **Pulse** — continuously send while ramping from a quiet background rate
-//!     to a sustained ceiling, growing mempool pressure beneath block cadence.
 //!   * **Firehose** — submit as fast as sign+POST allows; the mempool's capacity
 //!     rejections are the only brake (the cannon holds and retries the same
 //!     nonce on those, self-pacing to the drain rate).
@@ -303,7 +301,6 @@ impl Session {
 enum ModeChoice {
     PerBlock,
     TargetTps,
-    Pulse,
     Firehose,
 }
 
@@ -329,9 +326,6 @@ struct CannonApp {
     mode: ModeChoice,
     rate: String,
     tps: String,
-    pulse_start_tps: String,
-    pulse_max_tps: String,
-    pulse_ramp_secs: String,
     dry_run: bool,
     config_msg: String,
 
@@ -371,9 +365,6 @@ impl Default for CannonApp {
             mode: ModeChoice::PerBlock,
             rate: "1".to_string(),
             tps: "2".to_string(),
-            pulse_start_tps: "0.25".to_string(),
-            pulse_max_tps: "10".to_string(),
-            pulse_ramp_secs: "300".to_string(),
             dry_run: true,
             config_msg: String::new(),
             status: Arc::new(Mutex::new(Status::default())),
@@ -570,31 +561,6 @@ impl CannonApp {
                 }
                 _ => Err(format!("target TX/s must be between 0.1 and {MAX_TPS}")),
             },
-            ModeChoice::Pulse => {
-                let start = self.pulse_start_tps.trim().parse::<f64>();
-                let max = self.pulse_max_tps.trim().parse::<f64>();
-                let ramp = self.pulse_ramp_secs.trim().parse::<f64>();
-                match (start, max, ramp) {
-                    (Ok(start), Ok(max), Ok(ramp))
-                        if start.is_finite()
-                            && max.is_finite()
-                            && ramp.is_finite()
-                            && (0.01..=MAX_TPS).contains(&start)
-                            && (start..=MAX_TPS).contains(&max)
-                            && (1.0..=86_400.0).contains(&ramp) =>
-                    {
-                        let workers = n_workers.max(1) as f64;
-                        Ok(RateMode::Pulse {
-                            start_tps: start / workers,
-                            max_tps: max / workers,
-                            ramp_secs: ramp,
-                        })
-                    }
-                    _ => Err(format!(
-                        "pulse needs start 0.01–{MAX_TPS} TX/s, ceiling ≥ start, and ramp 1–86400 seconds"
-                    )),
-                }
-            }
             ModeChoice::Firehose => Ok(RateMode::Firehose),
         }
     }
@@ -708,13 +674,6 @@ impl CannonApp {
                     configs.len()
                 )
             }
-            (RateMode::Pulse { .. }, false) => format!(
-                "running: PULSE {}→{} TX/s over {}s across {} wallet(s)",
-                self.pulse_start_tps.trim(),
-                self.pulse_max_tps.trim(),
-                self.pulse_ramp_secs.trim(),
-                configs.len()
-            ),
             (RateMode::Firehose, false) => {
                 format!(
                     "running: FIREHOSE from {} wallet(s) — mempool is the brake",
@@ -872,6 +831,11 @@ struct WorkerState {
     known_balance: Option<u128>,
     /// Last chain height observed (for log lines).
     height: u64,
+    /// The network signing domain from `sov_getSigningDomain` — `None` while the
+    /// `tx-domain` fork is dormant (legacy signing), `Some` once active
+    /// (network-bound signing). Refreshed on each node reconcile so a cannon
+    /// running across the activation switches over automatically.
+    domain: Option<sov_primitives::SigningDomain>,
 }
 
 /// The firing worker for ONE wallet: owns a `Zeroizing` copy of that wallet's
@@ -909,6 +873,7 @@ fn run_worker(
         seq: NonceSequencer::new(),
         known_balance: None,
         height: 0,
+        domain: None,
     };
 
     match cfg.mode {
@@ -916,17 +881,6 @@ fn run_worker(
         RateMode::TargetTps(tps) => {
             run_continuous(&cfg, Some(Pacer::new(tps)), &mut ws, &status, &stop)
         }
-        RateMode::Pulse {
-            start_tps,
-            max_tps,
-            ramp_secs,
-        } => run_continuous(
-            &cfg,
-            Some(Pacer::growing(start_tps, max_tps, ramp_secs)),
-            &mut ws,
-            &status,
-            &stop,
-        ),
         RateMode::Firehose => run_continuous(&cfg, None, &mut ws, &status, &stop),
     }
 
@@ -1066,6 +1020,12 @@ fn sync_with_node(cfg: &WorkerConfig, ws: &mut WorkerState, status: &Arc<Mutex<S
     if let Ok(h) = ws.client.height() {
         ws.height = h;
     }
+    // Refresh the signing domain only on a definitive answer: a transient RPC
+    // failure must not silently downgrade an active-fork worker to legacy
+    // signatures (an old node without the method already answers `None`).
+    if let Ok(domain) = ws.client.signing_domain() {
+        ws.domain = domain;
+    }
     publish_wallet_stat(cfg, ws, status, None);
     true
 }
@@ -1140,7 +1100,15 @@ fn fire_once(
         }
     }
 
-    let stx = match build_signed_transfer(&cfg.seed, cfg.scheme, &cfg.from, &to, amount, nonce) {
+    let stx = match build_signed_transfer(
+        &cfg.seed,
+        cfg.scheme,
+        &cfg.from,
+        &to,
+        amount,
+        nonce,
+        ws.domain.as_ref(),
+    ) {
         Ok(s) => s,
         Err(e) => {
             record(status, MeterKind::Attempted);
@@ -1595,7 +1563,6 @@ impl eframe::App for CannonApp {
                                         ModeChoice::TargetTps,
                                         "Target TX/s",
                                     );
-                                    ui.radio_value(&mut self.mode, ModeChoice::Pulse, "Pulse (growing)");
                                     ui.radio_value(&mut self.mode, ModeChoice::Firehose, "Firehose (MAX)");
                                 });
                                 match self.mode {
@@ -1624,23 +1591,6 @@ impl eframe::App for CannonApp {
                                             egui::RichText::new(
                                                 "Steady pace decoupled from blocks; split evenly across the selected wallets. \
                                                  On-chain inclusion tops out around 1–5 TPS — expect the surplus to pool up.",
-                                            )
-                                            .small()
-                                            .weak(),
-                                        );
-                                    }
-                                    ModeChoice::Pulse => {
-                                        ui.horizontal(|ui| {
-                                            ui.label("Start TX/s");
-                                            ui.add(egui::TextEdit::singleline(&mut self.pulse_start_tps).desired_width(55.0));
-                                            ui.label("grow to");
-                                            ui.add(egui::TextEdit::singleline(&mut self.pulse_max_tps).desired_width(55.0));
-                                            ui.label("over seconds");
-                                            ui.add(egui::TextEdit::singleline(&mut self.pulse_ramp_secs).desired_width(70.0));
-                                        });
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "A constant background pulse that rises smoothly to its ceiling, then keeps sending until stopped. Rates are aggregate across selected wallets.",
                                             )
                                             .small()
                                             .weak(),
