@@ -13,6 +13,13 @@
 //!   * [`build_signed_transfer`] — reuses the chain's real `SignedTransaction::sign`
 //!     (no reimplemented crypto) to produce a verifiable transfer.
 //!
+//! It also owns every piece of *presentation* arithmetic the GUI needs — axis
+//! scaling ([`nice_ceiling`], [`scope_x`], [`scope_y`]), pressure bucketing
+//! ([`Pressure`]), readiness ([`first_blocker`]) and number formatting
+//! ([`fmt_rate`], [`fmt_count`], …) — so the drawing code contains no arithmetic
+//! that could divide by zero, produce NaN, or reach egui's geometry unbounded.
+//! All of it is unit-tested below.
+//!
 //! None of this holds or logs secret material: the signing seed is passed in by
 //! the caller only for the duration of a single [`build_signed_transfer`] call.
 
@@ -242,8 +249,6 @@ pub enum Disposition {
     /// what makes a refire after Stop self-heal instead of instantly killing every
     /// worker while the old run's mempool backlog drains.
     WaitAffordable,
-    /// This wallet cannot afford further traffic — stop its run and surface why.
-    StopWallet,
     /// Unknown failure: the slot was not provably consumed, so hold the nonce
     /// (a later duplicate/stale answer resolves it), back off, keep going.
     HoldAndRetryOther,
@@ -539,6 +544,241 @@ pub fn grains_to_xus(grains: u128) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Presentation logic — pure, bounded, panic-free. The GUI does no arithmetic
+// of its own; everything that could divide by zero or produce a NaN lives here
+// and is tested.
+// ---------------------------------------------------------------------------
+
+/// Width of the mempool scope's time axis, in seconds. The axis is FIXED at this
+/// width and right-anchored on "now", so the trace scrolls left at a constant
+/// speed instead of rescaling as history accumulates.
+pub const SCOPE_WINDOW_SECS: u64 = 300;
+
+/// Consecutive samples further apart than this are a data GAP, not a trend: the
+/// scope breaks its trace there rather than drawing a straight line across
+/// seconds in which the node told us nothing.
+pub const SCOPE_GAP_MS: u64 = 4_000;
+
+/// Round a peak depth up to a readable axis ceiling on the 1-2-5 ladder.
+///
+/// The floor of 100 matters for honesty: with a ceiling that hugs the data, a
+/// pool holding three transactions would draw a full-height trace and read as
+/// "saturated". Bounded — never zero (so [`scope_y`] can always divide by it)
+/// and never overflows.
+pub fn nice_ceiling(peak: u64) -> u64 {
+    const FLOOR: u64 = 100;
+    let p = peak.max(FLOOR);
+    let mut mag: u64 = 1;
+    // Largest power of ten <= p, saturating rather than wrapping.
+    while mag <= p / 10 {
+        match mag.checked_mul(10) {
+            Some(next) => mag = next,
+            None => return u64::MAX,
+        }
+    }
+    for m in [1u64, 2, 5] {
+        if let Some(c) = m.checked_mul(mag) {
+            if p <= c {
+                return c;
+            }
+        }
+    }
+    mag.saturating_mul(10)
+}
+
+/// Horizontal position of something `age_ms` old on a right-anchored time axis.
+///
+/// This is the primitive the axis furniture uses: an age is exact even when the
+/// app has been open for less than one window, where subtracting from a
+/// wall-clock stamp would saturate at zero and bunch every tick at the edge.
+/// A zero `window_ms` yields `right` (no division by zero).
+pub fn scope_x_age(age_ms: u64, window_ms: u64, left: f32, right: f32) -> f32 {
+    if window_ms == 0 {
+        return right;
+    }
+    let frac = (age_ms.min(window_ms) as f64 / window_ms as f64) as f32;
+    right - (right - left) * frac
+}
+
+/// Horizontal position of a sample taken at `at_ms` on the same axis.
+///
+/// `now_ms` is the right edge and `now_ms - window_ms` the left edge; anything
+/// older clamps to `left`, anything in the future clamps to `right`.
+pub fn scope_x(at_ms: u64, now_ms: u64, window_ms: u64, left: f32, right: f32) -> f32 {
+    scope_x_age(now_ms.saturating_sub(at_ms), window_ms, left, right)
+}
+
+/// Vertical position of a depth between `bottom` (zero) and `top` (`ceiling`).
+/// A zero ceiling yields `bottom`; depths above the ceiling clamp to `top`.
+pub fn scope_y(depth: u64, ceiling: u64, bottom: f32, top: f32) -> f32 {
+    if ceiling == 0 {
+        return bottom;
+    }
+    let frac = (depth as f64 / ceiling as f64).clamp(0.0, 1.0);
+    bottom + (top - bottom) * frac as f32
+}
+
+/// How loaded the mempool is. Rendered as a WORD and a distinct glyph shape as
+/// well as a color, so the state never depends on color perception.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pressure {
+    /// Nothing pooled.
+    Empty,
+    /// Under a quarter full.
+    Light,
+    /// Filling — under 60%.
+    Building,
+    /// Under the saturation line — the pool is not draining as fast as we fill it.
+    Heavy,
+    /// At or above the saturation line: further submissions are being refused.
+    Saturated,
+}
+
+impl Pressure {
+    /// Bucket a depth against the pool capacity. A zero `cap` (unknown) reads as
+    /// [`Pressure::Empty`] at depth 0 and [`Pressure::Building`] otherwise —
+    /// never a fabricated percentage.
+    pub fn of(depth: u64, cap: u64) -> Self {
+        if depth == 0 {
+            return Pressure::Empty;
+        }
+        if cap == 0 {
+            return Pressure::Building;
+        }
+        let pct = depth as f64 / cap as f64;
+        if pct >= 0.95 {
+            Pressure::Saturated
+        } else if pct >= 0.60 {
+            Pressure::Heavy
+        } else if pct >= 0.25 {
+            Pressure::Building
+        } else {
+            Pressure::Light
+        }
+    }
+
+    /// The word an operator reads.
+    pub fn label(self) -> &'static str {
+        match self {
+            Pressure::Empty => "EMPTY",
+            Pressure::Light => "LIGHT",
+            Pressure::Building => "BUILDING",
+            Pressure::Heavy => "HEAVY",
+            Pressure::Saturated => "SATURATED",
+        }
+    }
+
+    /// A shape that differs between levels independently of color.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Pressure::Empty => "○",
+            Pressure::Light => "◔",
+            Pressure::Building => "◑",
+            Pressure::Heavy => "◕",
+            Pressure::Saturated => "●",
+        }
+    }
+}
+
+/// What is stopping a run from starting. Only ONE is reported — the first thing
+/// the operator has to fix — so the control bar never nags with a list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blocker {
+    /// No wallets unlocked yet.
+    UnlockWallet,
+    /// Wallets are unlocked but none is checked.
+    SelectWallet,
+    /// Not one usable destination address.
+    AddDestination,
+}
+
+impl Blocker {
+    /// The imperative the operator should act on.
+    pub fn message(self) -> &'static str {
+        match self {
+            Blocker::UnlockWallet => "Unlock a wallet to arm the cannon",
+            Blocker::SelectWallet => "Check at least one wallet to fire from",
+            Blocker::AddDestination => "Add at least one destination address",
+        }
+    }
+}
+
+/// The first unmet precondition for firing, if any.
+///
+/// Node reachability is deliberately NOT a blocker: the workers retry a dead
+/// node and recover by themselves, so an unreachable node is surfaced as a
+/// warning in the status strip instead of locking the operator out.
+pub fn first_blocker(wallets: usize, selected: usize, destinations: usize) -> Option<Blocker> {
+    if wallets == 0 {
+        Some(Blocker::UnlockWallet)
+    } else if selected == 0 {
+        Some(Blocker::SelectWallet)
+    } else if destinations == 0 {
+        Some(Blocker::AddDestination)
+    } else {
+        None
+    }
+}
+
+/// Format a per-second rate with a stable width and consistent rounding.
+/// Non-finite or negative input renders as the explicit unavailable dash — the
+/// GUI never shows a made-up zero for a number it does not have.
+pub fn fmt_rate(v: f64) -> String {
+    if !v.is_finite() || v < 0.0 {
+        return "—".into();
+    }
+    if v < 100.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{}", v.round() as u64)
+    }
+}
+
+/// Group a count with thin thousands separators, so 16384 reads as 16,384.
+pub fn fmt_count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let first = digits.len() % 3;
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && i % 3 == first {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A percentage of `whole`, clamped to 0–100 and rendered with no decimals.
+/// A zero `whole` is unknown, not zero percent — it renders as a dash.
+pub fn fmt_pct(part: u64, whole: u64) -> String {
+    if whole == 0 {
+        return "—".into();
+    }
+    let pct = (part as f64 / whole as f64 * 100.0).clamp(0.0, 100.0);
+    format!("{}%", pct.round() as u64)
+}
+
+/// A share in `0.0..=1.0` for bar widths; a zero or non-finite total gives 0.0.
+/// Guaranteed finite and in range, so it can be handed straight to layout math.
+pub fn share(part: f64, total: f64) -> f32 {
+    if !part.is_finite() || !total.is_finite() || total <= 0.0 || part <= 0.0 {
+        return 0.0;
+    }
+    (part / total).clamp(0.0, 1.0) as f32
+}
+
+/// Compact elapsed time: `12s`, `4m 07s`, `2h 13m`.
+pub fn fmt_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3_600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m", secs / 3_600, (secs % 3_600) / 60)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,7 +877,6 @@ mod tests {
                     | Disposition::HoldAndRetryOther
                     | Disposition::WaitAffordable => {}
                     Disposition::Advance => seq.advance(),
-                    Disposition::StopWallet => break,
                     Disposition::ReconcileForward => unreachable!("use StaleWithNodeNonce"),
                 },
             }
@@ -1110,5 +1349,198 @@ mod tests {
         assert_eq!(grains_to_xus(150_000_000), "1.5");
         assert_eq!(grains_to_xus(100_000_000), "1");
         assert_eq!(grains_to_xus(1), "0.00000001");
+    }
+
+    // ---- Scope axis scaling (must be bounded + panic-free) ---------------
+
+    #[test]
+    fn nice_ceiling_climbs_the_1_2_5_ladder_and_never_hugs_the_data() {
+        // The floor keeps a nearly-empty pool from drawing as a full-height trace.
+        assert_eq!(nice_ceiling(0), 100);
+        assert_eq!(nice_ceiling(3), 100);
+        assert_eq!(nice_ceiling(100), 100);
+        assert_eq!(nice_ceiling(101), 200);
+        assert_eq!(nice_ceiling(200), 200);
+        assert_eq!(nice_ceiling(201), 500);
+        assert_eq!(nice_ceiling(500), 500);
+        assert_eq!(nice_ceiling(501), 1_000);
+        assert_eq!(nice_ceiling(16_384), 20_000);
+        assert_eq!(nice_ceiling(20_001), 50_000);
+        // Always >= the peak, always non-zero, for a wide sweep of inputs.
+        for peak in (0..200_000u64).step_by(97) {
+            let c = nice_ceiling(peak);
+            assert!(c >= peak, "ceiling {c} below peak {peak}");
+            assert!(c > 0);
+        }
+        // Extreme input saturates instead of overflowing.
+        assert!(nice_ceiling(u64::MAX) >= u64::MAX / 2);
+    }
+
+    #[test]
+    fn scope_x_is_right_anchored_and_clamped_to_the_axis() {
+        let (l, r) = (10.0f32, 110.0f32);
+        let now = 600_000u64;
+        let win = 300_000u64;
+        // "Now" sits on the right edge; a full window ago on the left edge.
+        assert!((scope_x(now, now, win, l, r) - r).abs() < 1e-3);
+        assert!((scope_x(now - win, now, win, l, r) - l).abs() < 1e-3);
+        // Halfway is the midpoint.
+        assert!((scope_x(now - win / 2, now, win, l, r) - 60.0).abs() < 1e-3);
+        // Older than the window clamps to the left edge (never off-canvas).
+        assert!((scope_x(0, now, win, l, r) - l).abs() < 1e-3);
+        // A future stamp (clock skew) clamps to the right edge, not past it.
+        assert!((scope_x(now + 90_000, now, win, l, r) - r).abs() < 1e-3);
+        // Degenerate window: no division by zero, no NaN.
+        let x = scope_x(5, 10, 0, l, r);
+        assert!(x.is_finite() && (x - r).abs() < 1e-3);
+    }
+
+    #[test]
+    fn scope_x_age_spreads_ticks_even_before_a_full_window_has_elapsed() {
+        let (l, r) = (0.0f32, 300.0f32);
+        let win = 300_000u64;
+        // The minute ticks of a 5-minute axis are evenly spaced from the first
+        // second the app is open — the failure mode this replaced bunched every
+        // tick against the right edge until 5 minutes had passed.
+        let xs: Vec<f32> = (0..=5)
+            .map(|m| scope_x_age(m * 60_000, win, l, r))
+            .collect();
+        assert_eq!(xs, vec![300.0, 240.0, 180.0, 120.0, 60.0, 0.0]);
+        // Older than the window still clamps onto the axis.
+        assert!((scope_x_age(999_999, win, l, r) - l).abs() < 1e-3);
+        assert!((scope_x_age(0, 0, l, r) - r).abs() < 1e-3);
+    }
+
+    #[test]
+    fn scope_y_is_clamped_between_baseline_and_ceiling() {
+        // egui's y grows downward: bottom > top.
+        let (bottom, top) = (200.0f32, 20.0f32);
+        assert!((scope_y(0, 1_000, bottom, top) - bottom).abs() < 1e-3);
+        assert!((scope_y(1_000, 1_000, bottom, top) - top).abs() < 1e-3);
+        assert!((scope_y(500, 1_000, bottom, top) - 110.0).abs() < 1e-3);
+        // Above the ceiling clamps to the top rather than drawing off-canvas.
+        assert!((scope_y(9_999, 1_000, bottom, top) - top).abs() < 1e-3);
+        // Zero ceiling can't divide by zero.
+        assert!((scope_y(7, 0, bottom, top) - bottom).abs() < 1e-3);
+        // Never NaN or infinite, for any pair.
+        for d in [0u64, 1, 12_345, u64::MAX] {
+            for c in [0u64, 1, 16_384, u64::MAX] {
+                assert!(scope_y(d, c, bottom, top).is_finite());
+            }
+        }
+    }
+
+    // ---- Pressure bucketing ----------------------------------------------
+
+    #[test]
+    fn pressure_buckets_match_the_saturation_line() {
+        let cap = 16_384u64;
+        assert_eq!(Pressure::of(0, cap), Pressure::Empty);
+        assert_eq!(Pressure::of(1, cap), Pressure::Light);
+        assert_eq!(Pressure::of(cap / 4 - 1, cap), Pressure::Light);
+        assert_eq!(Pressure::of(cap / 4 + 1, cap), Pressure::Building);
+        assert_eq!(Pressure::of(cap * 7 / 10, cap), Pressure::Heavy);
+        assert_eq!(Pressure::of(cap * 96 / 100, cap), Pressure::Saturated);
+        assert_eq!(Pressure::of(cap, cap), Pressure::Saturated);
+        // Over capacity is still saturated, not something stranger.
+        assert_eq!(Pressure::of(cap * 3, cap), Pressure::Saturated);
+        // Unknown capacity is never rendered as a percentage.
+        assert_eq!(Pressure::of(0, 0), Pressure::Empty);
+        assert_eq!(Pressure::of(5, 0), Pressure::Building);
+    }
+
+    #[test]
+    fn every_pressure_level_has_a_distinct_word_and_shape() {
+        let levels = [
+            Pressure::Empty,
+            Pressure::Light,
+            Pressure::Building,
+            Pressure::Heavy,
+            Pressure::Saturated,
+        ];
+        let labels: std::collections::HashSet<_> = levels.iter().map(|p| p.label()).collect();
+        let glyphs: std::collections::HashSet<_> = levels.iter().map(|p| p.glyph()).collect();
+        // Accessibility: state is never encoded by color alone.
+        assert_eq!(labels.len(), levels.len());
+        assert_eq!(glyphs.len(), levels.len());
+    }
+
+    // ---- Readiness --------------------------------------------------------
+
+    #[test]
+    fn first_blocker_reports_one_actionable_thing_at_a_time() {
+        assert_eq!(first_blocker(0, 0, 0), Some(Blocker::UnlockWallet));
+        assert_eq!(first_blocker(3, 0, 2), Some(Blocker::SelectWallet));
+        assert_eq!(first_blocker(3, 1, 0), Some(Blocker::AddDestination));
+        assert_eq!(first_blocker(3, 1, 1), None);
+        // Each blocker states what to DO.
+        for b in [
+            Blocker::UnlockWallet,
+            Blocker::SelectWallet,
+            Blocker::AddDestination,
+        ] {
+            assert!(!b.message().is_empty());
+        }
+    }
+
+    // ---- Formatting -------------------------------------------------------
+
+    #[test]
+    fn fmt_rate_is_stable_and_never_invents_a_zero() {
+        assert_eq!(fmt_rate(0.0), "0.0");
+        assert_eq!(fmt_rate(1.25), "1.2"); // banker-free, plain rounding
+        assert_eq!(fmt_rate(99.94), "99.9");
+        assert_eq!(fmt_rate(100.4), "100");
+        assert_eq!(fmt_rate(12_345.6), "12346");
+        // Unavailable stays unavailable — never rendered as 0.
+        assert_eq!(fmt_rate(f64::NAN), "—");
+        assert_eq!(fmt_rate(f64::INFINITY), "—");
+        assert_eq!(fmt_rate(-1.0), "—");
+    }
+
+    #[test]
+    fn fmt_count_groups_thousands() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(7), "7");
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(1_000), "1,000");
+        assert_eq!(fmt_count(16_384), "16,384");
+        assert_eq!(fmt_count(1_234_567), "1,234,567");
+        assert_eq!(fmt_count(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn fmt_pct_is_clamped_and_unknown_stays_unknown() {
+        assert_eq!(fmt_pct(0, 100), "0%");
+        assert_eq!(fmt_pct(50, 100), "50%");
+        assert_eq!(fmt_pct(100, 100), "100%");
+        assert_eq!(fmt_pct(300, 100), "100%"); // over cap clamps, never 300%
+        assert_eq!(fmt_pct(5, 0), "—"); // unknown capacity, not "0%"
+    }
+
+    #[test]
+    fn share_is_always_a_finite_fraction() {
+        assert_eq!(share(1.0, 4.0), 0.25);
+        assert_eq!(share(9.0, 4.0), 1.0);
+        assert_eq!(share(0.0, 0.0), 0.0);
+        assert_eq!(share(1.0, 0.0), 0.0);
+        assert_eq!(share(f64::NAN, 1.0), 0.0);
+        assert_eq!(share(1.0, f64::NAN), 0.0);
+        assert_eq!(share(-3.0, 4.0), 0.0);
+        for (p, t) in [(0.0, 1.0), (1e18, 1.0), (1.0, 1e18)] {
+            let s = share(p, t);
+            assert!(s.is_finite() && (0.0..=1.0).contains(&s));
+        }
+    }
+
+    #[test]
+    fn fmt_elapsed_reads_naturally_at_every_scale() {
+        assert_eq!(fmt_elapsed(0), "0s");
+        assert_eq!(fmt_elapsed(59), "59s");
+        assert_eq!(fmt_elapsed(60), "1m 00s");
+        assert_eq!(fmt_elapsed(127), "2m 07s");
+        assert_eq!(fmt_elapsed(3_599), "59m 59s");
+        assert_eq!(fmt_elapsed(3_600), "1h 00m");
+        assert_eq!(fmt_elapsed(7_980), "2h 13m");
     }
 }
