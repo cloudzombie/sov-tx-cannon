@@ -10,7 +10,7 @@
 //!   * [`RateMeter`] — rolling per-second throughput window for the live meters.
 //!   * [`DestSelector`] — round-robin or random choice over the destination list.
 //!   * [`AmountMode`] — a fixed value or a uniform draw in `[min, max]` inclusive.
-//!   * [`build_signed_transfer`] — reuses the chain's real `SignedTransaction::sign`
+//!   * [`build_signed_action`] — reuses the chain's real `SignedTransaction::sign`
 //!     (no reimplemented crypto) to produce a verifiable transfer.
 //!
 //! It also owns every piece of *presentation* arithmetic the GUI needs — axis
@@ -21,13 +21,13 @@
 //! All of it is unit-tested below.
 //!
 //! None of this holds or logs secret material: the signing seed is passed in by
-//! the caller only for the duration of a single [`build_signed_transfer`] call.
+//! the caller only for the duration of a single [`build_signed_action`] call.
 
 use std::collections::VecDeque;
 use std::time::Duration;
 
 use sov_crypto::Keypair;
-use sov_primitives::{AccountId, Balance, SigningDomain};
+use sov_primitives::{AccountId, SigningDomain};
 use sov_types::{Action, SignedTransaction, Transaction};
 
 /// A tiny, self-contained xorshift64\* PRNG.
@@ -62,6 +62,20 @@ impl Rng {
         x ^= x >> 27;
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// A full-width uniform draw.
+    ///
+    /// This is the randomness handed to the modules that deliberately do NOT own
+    /// a PRNG — [`crate::auction::TipSelector`] and [`crate::actionmix::ActionMix`]
+    /// both take a caller-supplied uniform `u128` so they stay pure and exactly
+    /// reproducible under test. Like the rest of this type it is for
+    /// non-security-sensitive choices only; nothing here ever feeds key, nonce-
+    /// secret, or signature material.
+    pub fn draw(&mut self) -> u128 {
+        let hi = u128::from(self.next_u64());
+        let lo = u128::from(self.next_u64());
+        (hi << 64) | lo
     }
 
     /// A uniform value in `[0, n)`; `0` if `n == 0`.
@@ -202,6 +216,23 @@ pub enum RejectClass {
     /// it landed): `"transaction already in the pool"` or `"a transaction with
     /// signer S and nonce N is already pooled"`.
     NonceOccupied,
+    /// The nonce is ABOVE the signer's contiguous run — it would leave a hole:
+    /// `"nonce gap: …"` (`MempoolError::NonceGap`,
+    /// `chain/crates/mempool/src/lib.rs:420-436`). SOV's mempool is gap-free by
+    /// design: there is no Ethereum-style future/queued tier, so such a tx is
+    /// REJECTED outright rather than parked. The cannon's own sequencer never
+    /// produces this, which is exactly why it deserves its own bucket — seeing
+    /// it means either a deliberate `adversary::Scenario::Gap` probe or that
+    /// something outside this tool moved the account's nonce.
+    NonceGap,
+    /// A replace-by-fee bid did not strictly outbid the transaction already in
+    /// the slot: `"replacement underpriced: this (signer, nonce) slot requires a
+    /// tip of at least R to replace"` (`MempoolError::RbfUnderpriced`,
+    /// `chain/crates/mempool/src/lib.rs:100-104`). Distinct from
+    /// [`NonceOccupied`](RejectClass::NonceOccupied): the slot is contested, but
+    /// a HIGHER bid would take it — which is exactly the signal
+    /// [`crate::auction::RbfPlan`] drives an RBF storm from.
+    RbfUnderpriced,
     /// The signer cannot afford it: `"insufficient balance: pooled transfers
     /// would move C grains but only A are held"`.
     Insufficient,
@@ -222,6 +253,10 @@ pub fn classify_reject(msg: &str) -> RejectClass {
         RejectClass::NonceStale
     } else if m.contains("already in the pool") || m.contains("already pooled") {
         RejectClass::NonceOccupied
+    } else if m.contains("nonce gap") {
+        RejectClass::NonceGap
+    } else if m.contains("replacement underpriced") {
+        RejectClass::RbfUnderpriced
     } else if m.contains("insufficient balance") {
         RejectClass::Insufficient
     } else {
@@ -260,6 +295,15 @@ pub fn disposition(class: RejectClass) -> Disposition {
         RejectClass::Capacity => Disposition::HoldAndRetry,
         RejectClass::NonceStale => Disposition::ReconcileForward,
         RejectClass::NonceOccupied => Disposition::Advance,
+        // A gap means our nonce ran AHEAD of the node's contiguous run — the slot
+        // was not consumed and never will be until the hole below it is filled.
+        // Re-query and reconcile rather than burning the nonce: committing here
+        // would widen the very hole that caused the rejection.
+        RejectClass::NonceGap => Disposition::ReconcileForward,
+        // The slot is contested but winnable: our bid was simply too low. The
+        // nonce was NOT consumed by us, so hold it and retry — with a higher tip
+        // if the run is bidding. Same disposition as capacity, different cause.
+        RejectClass::RbfUnderpriced => Disposition::HoldAndRetry,
         RejectClass::Insufficient => Disposition::WaitAffordable,
         RejectClass::Other => Disposition::HoldAndRetryOther,
     }
@@ -280,10 +324,15 @@ pub enum MeterKind {
     RejAfford = 4,
     /// Rejected: anything else (incl. transport errors).
     RejOther = 5,
+    /// Rejected: a replace-by-fee bid that did not strictly outbid the
+    /// transaction already in the slot. Its own bucket because it is the
+    /// auction's own signal — a losing BID, not a broken transaction — and an
+    /// RBF storm is measured by how often it appears and how fast it clears.
+    RejRbf = 6,
 }
 
 /// Number of [`MeterKind`] variants.
-pub const METER_KINDS: usize = 6;
+pub const METER_KINDS: usize = 7;
 
 /// A rolling per-second throughput meter over a short window of one-second
 /// buckets, plus cumulative totals. Time is caller-supplied milliseconds so it
@@ -483,16 +532,22 @@ pub fn derive_account_id(seed: &[u8; 32], scheme: KeyScheme) -> AccountId {
     // The transient keypair drops here; the caller keeps only the seed.
 }
 
-/// `domain` is the network [`SigningDomain`] from the node's
-/// `sov_getSigningDomain` (`RpcClient::signing_domain`): `None` while the
-/// `tx-domain` fork is dormant (legacy signature, byte-identical to before),
-/// `Some(domain)` once active (network-bound signature).
-pub fn build_signed_transfer(
+/// Build and sign ANY action using the chain's real signing path.
+///
+/// This is the single signing entry point for the whole tool: transfers, the
+/// action mix, tipped envelopes, and the domain A/B mode all go through it, so
+/// there is exactly one place where a signature is produced and it is the
+/// chain's own `SignedTransaction::sign_in`.
+///
+/// The seed is used only to derive a transient [`Keypair`] for this one
+/// signature; the keypair never outlives this call and is never stored or
+/// logged. `domain` is the network [`SigningDomain`] the signature is bound to
+/// (`None` = legacy, pre-activation).
+pub fn build_signed_action(
     seed: &[u8; 32],
     scheme: KeyScheme,
     from: &AccountId,
-    to: &AccountId,
-    amount_grains: u128,
+    action: Action,
     nonce: u64,
     domain: Option<&SigningDomain>,
 ) -> Result<SignedTransaction, String> {
@@ -501,10 +556,7 @@ pub fn build_signed_transfer(
         signer: from.clone(),
         public_key: keypair.public_key(),
         nonce,
-        action: Action::Transfer {
-            to: to.clone(),
-            amount: Balance::from_grains(amount_grains),
-        },
+        action,
     };
     SignedTransaction::sign_in(tx, &keypair, domain).map_err(|e| format!("signing failed: {e}"))
     // `keypair` drops here.
@@ -531,6 +583,19 @@ pub fn parse_xus(s: &str) -> Option<u128> {
     }
     let frac: u128 = frac_padded.parse().ok()?;
     whole.checked_mul(100_000_000)?.checked_add(frac)
+}
+
+/// Format a millisecond duration for a telemetry cell.
+///
+/// Sub-second latencies read in milliseconds, anything longer in seconds with
+/// one decimal — an inclusion latency of "148.3s" is instantly recognizable as
+/// "about one mainnet block", where "148300ms" is not.
+pub fn fmt_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    }
 }
 
 /// Format grains as a plain decimal XUS string (no thousands separators).
@@ -783,8 +848,18 @@ pub fn fmt_elapsed(secs: u64) -> String {
 mod tests {
     use super::*;
 
+    use sov_primitives::Balance;
+
     fn acct(name: &str) -> AccountId {
         AccountId::new(name).unwrap()
+    }
+
+    /// The plain transfer action the signing tests build around.
+    fn transfer(to: &AccountId, grains: u128) -> Action {
+        Action::Transfer {
+            to: to.clone(),
+            amount: Balance::from_grains(grains),
+        }
     }
 
     // ---- Nonce sequencer ------------------------------------------------
@@ -1005,6 +1080,24 @@ mod tests {
             )),
             RejectClass::Insufficient
         );
+        // The gap-free mempool's own refusal — SOV has no future/queued tier, so
+        // this is a REJECTION, not a park. Exact text from
+        // `MempoolError::NonceGap` (`chain/crates/mempool/src/lib.rs:110`).
+        assert_eq!(
+            classify_reject(&wrap(
+                "nonce gap: next mineable nonce is 12, transaction used 14"
+            )),
+            RejectClass::NonceGap
+        );
+        // A losing replace-by-fee bid — distinct from a merely occupied slot,
+        // because a higher bid WOULD take it. Exact text from
+        // `MempoolError::RbfUnderpriced` (`chain/crates/mempool/src/lib.rs:100`).
+        assert_eq!(
+            classify_reject(&wrap(
+                "replacement underpriced: this (signer, nonce) slot requires a tip of at least 2000 to replace"
+            )),
+            RejectClass::RbfUnderpriced
+        );
         assert_eq!(
             classify_reject(&wrap("invalid transaction signature")),
             RejectClass::Other
@@ -1035,6 +1128,14 @@ mod tests {
         assert_eq!(
             disposition(RejectClass::NonceOccupied),
             Disposition::Advance
+        );
+        assert_eq!(
+            disposition(RejectClass::NonceGap),
+            Disposition::ReconcileForward
+        );
+        assert_eq!(
+            disposition(RejectClass::RbfUnderpriced),
+            Disposition::HoldAndRetry
         );
         assert_eq!(
             disposition(RejectClass::Insufficient),
@@ -1248,8 +1349,15 @@ mod tests {
         let seed = [7u8; 32];
         let from = acct("cannon.sov");
         let to = acct("target.sov");
-        let stx =
-            build_signed_transfer(&seed, KeyScheme::Ed25519, &from, &to, 42_000, 9, None).unwrap();
+        let stx = build_signed_action(
+            &seed,
+            KeyScheme::Ed25519,
+            &from,
+            transfer(&to, 42_000),
+            9,
+            None,
+        )
+        .unwrap();
 
         // Signature verifies against the committed public key.
         assert!(stx.verify_signature(), "signature must verify");
@@ -1270,18 +1378,69 @@ mod tests {
     }
 
     #[test]
+    fn a_tipped_transfer_signs_and_verifies_through_the_chains_own_signer() {
+        let seed = [11u8; 32];
+        let from = acct("cannon.sov");
+        // `auction::wrap_tipped` is the ONE place the fee-auction envelope is
+        // built (it refuses exactly what consensus refuses); this proves the
+        // single signing path carries it faithfully.
+        let action = crate::auction::wrap_tipped(
+            Action::Transfer {
+                to: acct("target.sov"),
+                amount: Balance::from_grains(1_000),
+            },
+            2_500,
+        )
+        .expect("a tipped transfer is a legal envelope");
+        let stx =
+            build_signed_action(&seed, KeyScheme::Ed25519, &from, action, 3, None).expect("signs");
+        assert!(stx.verify_signature(), "tipped signature must verify");
+        match &stx.transaction.action {
+            Action::Tipped { tip, inner } => {
+                assert_eq!(*tip, Balance::from_grains(2_500));
+                assert!(matches!(**inner, Action::Transfer { .. }));
+            }
+            other => panic!("expected Tipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_signed_action_is_the_same_signer_the_transfer_helper_uses() {
+        // The transfer helper is a thin wrapper; both paths must produce a
+        // byte-identical transaction so there is exactly ONE signing path.
+        let seed = [3u8; 32];
+        let from = acct("cannon.sov");
+        let to = acct("target.sov");
+        let via_helper =
+            build_signed_action(&seed, KeyScheme::Ed25519, &from, transfer(&to, 77), 5, None)
+                .unwrap();
+        let via_action = build_signed_action(
+            &seed,
+            KeyScheme::Ed25519,
+            &from,
+            Action::Transfer {
+                to: to.clone(),
+                amount: Balance::from_grains(77),
+            },
+            5,
+            None,
+        )
+        .unwrap();
+        assert_eq!(via_helper.transaction.id(), via_action.transaction.id());
+    }
+
+    #[test]
     fn domain_bound_transfer_verifies_only_under_its_domain() {
         use sov_primitives::Hash;
         let seed = [7u8; 32];
         let from = acct("cannon.sov");
         let to = acct("target.sov");
         let domain = SigningDomain::new("sov-mainnet", Hash::digest(b"g"));
-        let bound = build_signed_transfer(
+        let bound = build_signed_action(
             &seed,
             KeyScheme::Ed25519,
             &from,
-            &to,
-            42_000,
+            transfer(&to, 42_000),
             9,
             Some(&domain),
         )
@@ -1289,20 +1448,26 @@ mod tests {
         assert!(bound.verify_signature_in(Some(&domain)));
         assert!(!bound.verify_signature(), "bound sig must NOT pass legacy");
         // The tx id is domain-independent (hash of the un-framed body).
-        let legacy =
-            build_signed_transfer(&seed, KeyScheme::Ed25519, &from, &to, 42_000, 9, None).unwrap();
+        let legacy = build_signed_action(
+            &seed,
+            KeyScheme::Ed25519,
+            &from,
+            transfer(&to, 42_000),
+            9,
+            None,
+        )
+        .unwrap();
         assert_eq!(bound.id(), legacy.id());
     }
 
     #[test]
     fn built_transfer_round_trips_through_borsh_and_still_verifies() {
         let seed = [3u8; 32];
-        let stx = build_signed_transfer(
+        let stx = build_signed_action(
             &seed,
             KeyScheme::Hybrid65,
             &acct("cannon.sov"),
-            &acct("target.sov"),
-            1,
+            transfer(&acct("target.sov"), 1),
             0,
             None,
         )

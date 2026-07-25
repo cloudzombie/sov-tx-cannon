@@ -43,6 +43,63 @@ repository boundary is stated in [AGENTS.md](AGENTS.md).
 - **Live operator telemetry.** Attempted / accepted / rejected per second, a
   rejection breakdown mapped from the node's real reject strings, mempool depth
   with a saturation flag, and a rolling throughput scope.
+- **It drives the blockspace auction, not just throughput.** Each transaction can
+  carry a priority tip — one fixed bid, or a *ladder* of bids in a single run —
+  and the tool reports inclusion latency per bid, so "does inclusion order follow
+  bid order?" is answerable from measurement rather than assumption.
+- **It measures confirmation, not just acceptance.** Every accepted submission is
+  followed to inclusion in a real block, with reorg detection: a transaction
+  un-mined by a reorg is reported as un-mined, not left counted as confirmed.
+- **It fires more than transfers.** A weighted action mix draws from the action
+  kinds a traffic generator can build self-containedly, including one whose
+  encoded size you dial directly — which is what probes the block-space cap
+  rather than the transaction-count cap.
+
+### The auction: bids, floors and replacement
+
+The fee auction (v0.1.98) is mempool policy: a tip rides inside
+`Action::Tipped`, is a pure signer→miner transfer, and an untipped transaction is
+never rejected for bidding zero — it simply waits behind funded bids. The tool
+mirrors the node's rules exactly rather than guessing them:
+
+- **Tip ladder** (`src/auction.rs`) — bids drawn from ascending rungs,
+  round-robin or random. Round-robin gives every rung the same population, which
+  is what makes a latency comparison across rungs meaningful.
+- **Floor discovery** — a ramp-down that turns accept/refuse answers into a
+  *bracket* around the pool's dynamic floor: the highest bid refused and the
+  lowest accepted. The floor moves while you probe, so a non-monotonic result is
+  reported as inverted with an explanation instead of a fabricated number.
+- **Replace-by-fee** — the node requires a strict outbid, and a bump of exactly
+  `MIN_RBF_BUMP_GRAINS` (1,000) *does* replace: the comparison is `<`, not `<=`
+  (`chain/crates/mempool/src/lib.rs:456-463`). The tool reproduces that boundary
+  precisely, and a losing bid gets its own meter row rather than being buried in
+  "other".
+
+### Adversarial probes
+
+Two probe families produce a **verdict**, not just a log line — and are
+deliberately biased toward *inconclusive*, because this tool is pointed at a live
+mainnet and a false accusation of a consensus bug is worse than an admission of
+ignorance:
+
+- **Nonce scenarios** (`src/adversary.rs`) — deliberately open a hole, submit out
+  of order, replay a nonce. SOV's mempool is gap-free (there is no
+  future/queued tier), so each step has an outcome the node MUST produce. Every
+  probe is bracketed by two `sov_getNonce` reads so a third party spending from
+  the same account cannot be mistaken for a node bug.
+- **tx-domain A/B** — the 3×3 table over (activation phase × which domain the
+  signature was framed under). One cell is non-negotiable: a **wrong-domain
+  signature must be refused in every phase**. That assertion is phase-independent
+  on purpose, so it stays meaningful even though no RPC currently exposes the
+  grace-window length needed to distinguish Grace from Bound.
+
+**Wiring status, stated plainly.** The tip ladder, the action mix and the
+confirmation/latency tracking are wired end to end: configurable in the GUI,
+driven by the worker, and reported live. The floor probe, the RBF plan, the
+nonce scenarios and the tx-domain A/B table are complete, cited and unit-tested
+decision surfaces that do not yet have their own GUI run mode — they are
+consumed today by the classifier and the meters, not by a dedicated "probe" button.
+Do not read this section as claiming a one-click probe run exists.
 
 It only READS chain state and SUBMITS already-signed transactions over the same
 key-free RPC surface any wallet uses. It touches no consensus, mining,

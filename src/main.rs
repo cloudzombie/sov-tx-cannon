@@ -29,6 +29,10 @@
 //! wallet signing seed live in `zeroize`-wiped buffers for the session only;
 //! nothing secret is ever written to disk or logged.
 
+mod actionmix;
+mod adversary;
+mod auction;
+mod confirm;
 mod logic;
 
 use std::path::PathBuf;
@@ -42,9 +46,12 @@ use zeroize::{Zeroize, Zeroizing};
 use sov_primitives::AccountId;
 use sov_rpc::{Keystore, RpcClient};
 
+use actionmix::{build_action, ActionKind, ActionMix, ActionParams};
+use auction::{wrap_tipped, LadderMode, TipPolicy, TipSelector};
+use confirm::{BlockId, ConfirmTracker, TxId};
 use logic::{
-    build_signed_transfer, classify_reject, derive_account_id, disposition, first_blocker,
-    fmt_count, fmt_elapsed, fmt_pct, fmt_rate, grains_to_xus, nice_ceiling, parse_xus, scope_x,
+    build_signed_action, classify_reject, derive_account_id, disposition, first_blocker, fmt_count,
+    fmt_elapsed, fmt_ms, fmt_pct, fmt_rate, grains_to_xus, nice_ceiling, parse_xus, scope_x,
     scope_x_age, scope_y, share, AmountMode, DestMode, DestSelector, Disposition, KeyScheme,
     MeterKind, NonceSequencer, Pacer, Pressure, RateMeter, RateMode, RejectClass, Rng,
     SCOPE_GAP_MS, SCOPE_WINDOW_SECS,
@@ -415,6 +422,7 @@ impl Status {
         let bad = self.meter.total(MeterKind::RejCapacity)
             + self.meter.total(MeterKind::RejNonce)
             + self.meter.total(MeterKind::RejAfford)
+            + self.meter.total(MeterKind::RejRbf)
             + self.meter.total(MeterKind::RejOther);
         (ok, bad)
     }
@@ -437,6 +445,24 @@ struct WorkerConfig {
     /// split across the selected wallets).
     mode: RateMode,
     dry_run: bool,
+    /// What each transaction BIDS into the blockspace auction (untipped, a fixed
+    /// tip, or a rung of the ladder). Each worker gets its own selector so the
+    /// round-robin ladder is per-wallet and not a contended cursor.
+    tip: TipSelector,
+    /// The weighted action mix this worker draws from.
+    mix: ActionMix,
+    /// Symbol used by the `TokenIssue` / `NftMint` draws.
+    mix_symbol: String,
+    /// Prefix for the `*.sov` names a `RegisterName` draw claims.
+    mix_name_prefix: String,
+    /// Padding attached to `NftMint` metadata, so a run can dial tx SIZE.
+    mix_metadata_bytes: usize,
+    /// Shared confirmation tracker: every accepted submission is registered here
+    /// so the monitor can follow it to inclusion (or to a reorg, or to a drop).
+    confirm: Arc<Mutex<ConfirmTracker>>,
+    /// The process-wide clock origin. Every thread stamps the tracker from this
+    /// one origin, so a latency is a real difference and never mixes clocks.
+    clock0: Instant,
 }
 
 /// A running firing session: one shared stop flag, one monitor thread, and one
@@ -455,6 +481,18 @@ impl Session {
             let _ = h.join();
         }
     }
+}
+
+/// Which bid-shape radio is selected in the UI.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TipChoice {
+    /// No fee-auction envelope at all — the cannon's original traffic.
+    Untipped,
+    /// One tip for every transaction.
+    Fixed,
+    /// A spread of bids across a ladder of rungs, which is what makes
+    /// "does inclusion order follow bid order?" answerable.
+    Ladder,
 }
 
 /// Which rate-mode radio is selected in the UI.
@@ -489,6 +527,36 @@ struct CannonApp {
     tps: String,
     dry_run: bool,
     config_msg: String,
+
+    // ---- Blockspace auction (what each tx BIDS) ----
+    /// Which bid shape the run uses.
+    tip_choice: TipChoice,
+    /// Fixed-tip amount, in XUS (parsed with the same `parse_xus` as amounts).
+    tip_fixed: String,
+    /// The ladder's rungs, in XUS, comma-separated — one run, many bids.
+    tip_ladder: String,
+    /// Ladder rungs drawn at random rather than round-robin.
+    tip_ladder_random: bool,
+
+    // ---- Action mix (what SHAPE each tx is) ----
+    /// Per-kind weights, indexed by `ActionKind::ALL`.
+    mix_weights: [u64; 4],
+    /// Symbol for the `TokenIssue` / `NftMint` draws.
+    mix_symbol: String,
+    /// Prefix for the `*.sov` names a `RegisterName` draw claims.
+    mix_name_prefix: String,
+    /// NFT metadata padding, in bytes — the knob that dials transaction SIZE.
+    mix_metadata: String,
+    /// Explicit acknowledgement that a kind in the mix spends real XUS beyond
+    /// gas. Never persisted, never defaulted on.
+    ack_costly_actions: bool,
+
+    // ---- Confirmation tracking ----
+    /// Follows every accepted submission to inclusion, and notices reorgs.
+    /// Shared with the workers (who register) and the monitor (who observes).
+    confirm: Arc<Mutex<ConfirmTracker>>,
+    /// The one clock origin every thread stamps the tracker from.
+    clock0: Instant,
 
     // Live run.
     status: Arc<Mutex<Status>>,
@@ -547,6 +615,22 @@ impl Default for CannonApp {
             mode: ModeChoice::PerBlock,
             rate: "1".to_string(),
             tps: "2".to_string(),
+            // Default to the pre-auction behavior: bare, untipped transfers.
+            // Bidding is opt-in, because a tip is real XUS paid to a miner.
+            tip_choice: TipChoice::Untipped,
+            tip_fixed: "0.00002".to_string(),
+            // A decade-spanning ladder: each rung is 5x the one below, so one run
+            // produces bids that are unambiguously ordered.
+            tip_ladder: "0.00001, 0.00005, 0.00025, 0.00125".to_string(),
+            tip_ladder_random: false,
+            // Transfers only, matching the cannon's original traffic.
+            mix_weights: [1, 0, 0, 0],
+            mix_symbol: "CANNON".to_string(),
+            mix_name_prefix: "cannon".to_string(),
+            mix_metadata: "0".to_string(),
+            ack_costly_actions: false,
+            confirm: Arc::new(Mutex::new(ConfirmTracker::new())),
+            clock0: Instant::now(),
             dry_run: true,
             config_msg: String::new(),
             status: Arc::new(Mutex::new(Status::default())),
@@ -735,6 +819,82 @@ impl CannonApp {
     /// Parse + validate the rate mode from the UI fields. `n_workers` is how
     /// many wallets will fire: Target TX/s is split evenly across them so the
     /// AGGREGATE rate matches what the user typed.
+    /// Read the bid configuration into a [`TipPolicy`].
+    ///
+    /// Amounts are entered in XUS and parsed with the SAME `parse_xus` the
+    /// transfer amount uses, so "0.0001" means the same thing in both boxes.
+    fn parse_tip_policy(&self) -> Result<TipPolicy, String> {
+        match self.tip_choice {
+            TipChoice::Untipped => Ok(TipPolicy::Untipped),
+            TipChoice::Fixed => match parse_xus(&self.tip_fixed) {
+                Some(g) if g > 0 => Ok(TipPolicy::Fixed(g)),
+                Some(_) => Err("a fixed tip must be greater than zero (or choose Untipped)".into()),
+                None => Err(format!(
+                    "`{}` is not a valid XUS tip",
+                    self.tip_fixed.trim()
+                )),
+            },
+            TipChoice::Ladder => {
+                let mut rungs = Vec::new();
+                for part in self.tip_ladder.split(',') {
+                    let t = part.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    match parse_xus(t) {
+                        Some(g) => rungs.push(g),
+                        None => return Err(format!("`{t}` is not a valid XUS tip")),
+                    }
+                }
+                // `TipPolicy::validate` is the authority on ascending/distinct/
+                // non-zero; sorting first means an operator can type the rungs
+                // in any order without being scolded for it.
+                rungs.sort_unstable();
+                rungs.dedup();
+                let policy = TipPolicy::Ladder {
+                    rungs,
+                    mode: if self.tip_ladder_random {
+                        LadderMode::Random
+                    } else {
+                        LadderMode::RoundRobin
+                    },
+                };
+                policy.validate()?;
+                Ok(policy)
+            }
+        }
+    }
+
+    /// Read the per-kind weights into an [`ActionMix`].
+    fn parse_action_mix(&self) -> Result<ActionMix, String> {
+        let weights: Vec<(ActionKind, u64)> = ActionKind::ALL
+            .iter()
+            .zip(self.mix_weights.iter())
+            .map(|(k, w)| (*k, *w))
+            .collect();
+        let mix = ActionMix::new(&weights)?;
+        // Validate the shared parameters ONCE here, so a misconfigured symbol or
+        // name prefix fails before the run arms rather than once per draw.
+        let drawn: Vec<ActionKind> = ActionKind::ALL
+            .iter()
+            .zip(self.mix_weights.iter())
+            .filter(|(_, w)| **w > 0)
+            .map(|(k, _)| *k)
+            .collect();
+        if drawn
+            .iter()
+            .any(|k| matches!(k, ActionKind::TokenIssue | ActionKind::NftMint))
+        {
+            actionmix::validate_symbol(self.mix_symbol.trim())?;
+        }
+        if drawn.contains(&ActionKind::RegisterName) {
+            // Probe the generator once: a bad prefix must not be discovered
+            // after the first registration fee has already been paid.
+            actionmix::cannon_name(self.mix_name_prefix.trim(), 0)?;
+        }
+        Ok(mix)
+    }
+
     fn parse_rate_mode(&self, n_workers: usize) -> Result<RateMode, String> {
         match self.mode {
             ModeChoice::PerBlock => match self.rate.trim().parse::<u32>() {
@@ -795,6 +955,45 @@ impl CannonApp {
         } else {
             DestMode::RoundRobin
         };
+        let tip = match self.parse_tip_policy().and_then(TipSelector::new) {
+            Ok(t) => t,
+            Err(e) => {
+                self.config_msg = e;
+                return None;
+            }
+        };
+        let mix = match self.parse_action_mix() {
+            Ok(m) => m,
+            Err(e) => {
+                self.config_msg = e;
+                return None;
+            }
+        };
+        // Refuse a run whose action mix would spend XUS the operator has not
+        // explicitly acknowledged. This tool fires REAL transactions; a name
+        // registration fee is irreversible and is never charged by accident.
+        let costly = mix.costly_kinds();
+        if !costly.is_empty() && !self.ack_costly_actions {
+            self.config_msg = format!(
+                "{} charges a real one-time fee on every draw — tick “I accept the extra XUS cost” to arm it",
+                costly
+                    .iter()
+                    .map(|k| k.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return None;
+        }
+        let metadata_bytes = match self.mix_metadata.trim().parse::<usize>() {
+            Ok(n) if n <= actionmix::MAX_METADATA_BYTES => n,
+            _ => {
+                self.config_msg = format!(
+                    "NFT metadata padding must be a whole number of bytes, at most {}",
+                    actionmix::MAX_METADATA_BYTES
+                );
+                return None;
+            }
+        };
         let configs = selected
             .into_iter()
             .enumerate()
@@ -814,6 +1013,13 @@ impl CannonApp {
                     amount_mode,
                     mode,
                     dry_run: self.dry_run,
+                    tip: tip.clone(),
+                    mix: mix.clone(),
+                    mix_symbol: self.mix_symbol.trim().to_string(),
+                    mix_name_prefix: self.mix_name_prefix.trim().to_string(),
+                    mix_metadata_bytes: metadata_bytes,
+                    confirm: Arc::clone(&self.confirm),
+                    clock0: self.clock0,
                 }
             })
             .collect();
@@ -950,7 +1156,13 @@ fn run_conn_monitor(
     addr: Arc<Mutex<String>>,
     stop: Arc<AtomicBool>,
     ctx: eframe::egui::Context,
+    confirm: Arc<Mutex<ConfirmTracker>>,
+    clock0: Instant,
 ) {
+    // The last height whose block we have already fed to the tracker. `None`
+    // until the first successful read, so a fresh app does not try to walk the
+    // entire chain looking for its own (nonexistent) transactions.
+    let mut scanned: Option<u64> = None;
     while !stop.load(Ordering::SeqCst) {
         let a = addr.lock().map(|s| s.clone()).unwrap_or_default();
         let client = RpcClient::new(a).with_timeout(Duration::from_secs(3));
@@ -983,8 +1195,104 @@ fn run_conn_monitor(
                 hist.sample(h, d as u64);
             }
         }
+        if let Some(h) = height_ok {
+            scan_blocks(&client, &confirm, clock0, h, &mut scanned, &stop);
+        }
         ctx.request_repaint();
         sleep_interruptible(&stop, Duration::from_secs(1));
+    }
+}
+
+/// How many blocks behind the tip one monitor pass will walk.
+///
+/// A cold start, a long stall, or a deep reorg could otherwise ask the node for
+/// thousands of blocks in one pass and wedge the monitor (which also drives the
+/// connection indicator). Capping the walk keeps the monitor responsive; the
+/// skipped heights simply go unobserved, which the tracker reports honestly as
+/// drops rather than as confirmations.
+const MAX_BLOCK_SCAN_PER_PASS: u64 = 16;
+
+/// How long an accepted transaction may stay unseen before it is called dropped.
+///
+/// Ten minutes is four mainnet block intervals (150 s), so a transaction that
+/// merely waited out a few full blocks is never mislabelled; something still
+/// missing after that was evicted, replaced, or never propagated.
+const CONFIRM_TTL_MS: u64 = 10 * 60 * 1000;
+
+/// Walk any blocks that appeared since the last pass and feed them to the
+/// confirmation tracker, then age out anything that never arrived.
+///
+/// Re-reads the CURRENT tip block on every pass even when the height has not
+/// moved: that is what detects a reorg that replaced the tip in place. Every RPC
+/// failure is survivable — an unread block leaves `scanned` where it was, so the
+/// next pass retries it rather than skipping it silently.
+fn scan_blocks(
+    client: &RpcClient,
+    confirm: &Arc<Mutex<ConfirmTracker>>,
+    clock0: Instant,
+    tip: u64,
+    scanned: &mut Option<u64>,
+    stop: &Arc<AtomicBool>,
+) {
+    let from = match *scanned {
+        // First pass: start AT the tip. Blocks mined before this app opened
+        // cannot contain this run's transactions.
+        None => tip,
+        // Re-read the last height too, so a tip replaced by a reorg is seen.
+        Some(last) => last
+            .min(tip)
+            .max(tip.saturating_sub(MAX_BLOCK_SCAN_PER_PASS)),
+    };
+    for h in from..=tip {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let block = match client.block_by_height(h) {
+            Ok(Some(b)) => b,
+            // No such block yet, or the node could not answer: leave `scanned`
+            // short so the next pass retries this height.
+            _ => return,
+        };
+        let ids: Vec<TxId> = block
+            .transactions
+            .iter()
+            .map(|stx| TxId::new(*stx.id().as_bytes()))
+            .collect();
+        let now_ms = clock0.elapsed().as_millis() as u64;
+        if let Ok(mut tracker) = confirm.lock() {
+            tracker.observe_block(h, BlockId::new(*block.hash().as_bytes()), &ids, now_ms);
+            tracker.expire(now_ms, CONFIRM_TTL_MS);
+        }
+        *scanned = Some(h);
+    }
+}
+
+/// Register an accepted submission with the shared confirmation tracker.
+///
+/// The tip BUCKET comes from the worker's own tip policy, so the latency
+/// histogram reports percentiles against exactly the bids this run made rather
+/// than an invented scale. Bucket keys are assigned per policy rung; anything
+/// beyond the tracker's bucket cap is counted as unbucketed rather than stored,
+/// which is the tracker's own documented degradation.
+///
+/// A poisoned tracker lock is survivable — the run keeps firing and only the
+/// measurement is lost — so this never unwraps and never panics a worker.
+fn register_in_flight(
+    cfg: &WorkerConfig,
+    height: u64,
+    txid: &sov_primitives::Hash,
+    tip_grains: u128,
+) {
+    let bucket = cfg.tip.bucket_key(tip_grains);
+    let now_ms = cfg.clock0.elapsed().as_millis() as u64;
+    if let Ok(mut tracker) = cfg.confirm.lock() {
+        let _ = tracker.register(
+            TxId::new(*txid.as_bytes()),
+            now_ms,
+            height,
+            tip_grains,
+            bucket,
+        );
     }
 }
 
@@ -1012,6 +1320,11 @@ struct WorkerState {
     known_balance: Option<u128>,
     /// Last chain height observed (for log lines).
     height: u64,
+    /// This worker's own bid selector. It lives here rather than on the config
+    /// because a round-robin ladder carries a CURSOR: sharing one across wallets
+    /// would make the rungs interleave unpredictably instead of each wallet
+    /// walking the whole ladder.
+    tip: TipSelector,
     /// The network signing domain from `sov_getSigningDomain` — `None` while the
     /// `tx-domain` fork is dormant (legacy signing), `Some` once active
     /// (network-bound signing). Refreshed on each node reconcile so a cannon
@@ -1054,6 +1367,7 @@ fn run_worker(
         seq: NonceSequencer::new(),
         known_balance: None,
         height: 0,
+        tip: cfg.tip.clone(),
         domain: None,
     };
 
@@ -1305,12 +1619,39 @@ fn fire_once(
         }
     }
 
-    let stx = match build_signed_transfer(
+    // Draw this transaction's SHAPE (which action) and its BID (what tip, if
+    // any) before signing. Both draws consume the worker's own RNG, so a run is
+    // reproducible per worker and the ladder/mix are independent per wallet.
+    let kind = cfg.mix.pick(ws.rng.draw());
+    let draw = ws.rng.draw();
+    let tip_grains = ws.tip.next_tip(draw).unwrap_or(0);
+    let params = ActionParams {
+        to: to.clone(),
+        amount_grains: amount,
+        // The nonce is unique per signer by construction, so it is the natural
+        // discriminator for the name/token-id a repeatable draw needs.
+        unique: nonce,
+        symbol: cfg.mix_symbol.clone(),
+        metadata_bytes: cfg.mix_metadata_bytes,
+    };
+
+    let action = match build_action(kind, &params, &cfg.mix_name_prefix)
+        .and_then(|inner| wrap_tipped(inner, tip_grains))
+    {
+        Ok(a) => a,
+        Err(e) => {
+            record(status, MeterKind::Attempted);
+            record(status, MeterKind::RejOther);
+            log_tx(status, cfg, ws.height, &to, amount, nonce, false, &e);
+            return FireResult::Continue;
+        }
+    };
+
+    let stx = match build_signed_action(
         &cfg.seed,
         cfg.scheme,
         &cfg.from,
-        &to,
-        amount,
+        action,
         nonce,
         ws.domain.as_ref(),
     ) {
@@ -1357,6 +1698,11 @@ fn fire_once(
             if commit_on_accept {
                 ws.seq.advance();
             }
+            // Accepted is NOT confirmed. Hand the id to the tracker so the
+            // monitor can follow it to inclusion — and notice if a reorg later
+            // un-mines it. The bucket is the ladder rung this tx bid, which is
+            // what makes the latency percentiles comparable across bids.
+            register_in_flight(cfg, ws.height, &txid, tip_grains);
             log_tx(
                 status,
                 cfg,
@@ -1378,8 +1724,11 @@ fn fire_once(
                 status,
                 match class {
                     RejectClass::Capacity => MeterKind::RejCapacity,
-                    RejectClass::NonceStale | RejectClass::NonceOccupied => MeterKind::RejNonce,
+                    RejectClass::NonceStale
+                    | RejectClass::NonceOccupied
+                    | RejectClass::NonceGap => MeterKind::RejNonce,
                     RejectClass::Insufficient => MeterKind::RejAfford,
+                    RejectClass::RbfUnderpriced => MeterKind::RejRbf,
                     RejectClass::Other => MeterKind::RejOther,
                 },
             );
@@ -2003,7 +2352,9 @@ impl eframe::App for CannonApp {
                 self.conn_stop.clone(),
                 ctx.clone(),
             );
-            thread::spawn(move || run_conn_monitor(conn, hist, addr, stop, ctx2));
+            let confirm = Arc::clone(&self.confirm);
+            let clock0 = self.clock0;
+            thread::spawn(move || run_conn_monitor(conn, hist, addr, stop, ctx2, confirm, clock0));
         }
         // Propagate the current RPC address to the monitor (so edits take effect).
         if let Ok(mut a) = self.conn_addr.lock() {
@@ -2749,6 +3100,353 @@ impl CannonApp {
             });
         });
         ui.add_space(8.0);
+
+        self.auction_card(ui, running);
+        ui.add_space(8.0);
+    }
+
+    /// Telemetry — what the CHAIN did with what the node accepted.
+    ///
+    /// "Accepted" is a mempool answer; this card is the chain's. It reports how
+    /// many submissions were actually included, how many are still in flight,
+    /// how many were un-mined by a reorg, how many aged out — and the inclusion
+    /// latency per tip bucket, which is the number that characterizes the fee
+    /// market. Every value here is measured; nothing is estimated. When there is
+    /// no data the cells read "—", never zero.
+    fn confirmations_card(&mut self, ui: &mut Ui) {
+        let Ok(tracker) = self.confirm.lock() else {
+            card_frame().show(ui, |ui| {
+                ui.set_width(ui.available_width() - 4.0);
+                ui.label(
+                    RichText::new("confirmation tracking unavailable (tracker state is poisoned)")
+                        .small()
+                        .color(palette::RED),
+                );
+            });
+            return;
+        };
+        let stats = tracker.stats();
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width() - 4.0);
+            eyebrow(ui, "confirmations");
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                let cell = |ui: &mut Ui, label: &str, value: String, color: egui::Color32| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(label).small().color(palette::DIM));
+                        ui.label(RichText::new(value).monospace().color(color));
+                    });
+                    ui.add_space(14.0);
+                };
+                cell(ui, "confirmed", fmt_count(stats.confirmed), palette::GREEN);
+                cell(
+                    ui,
+                    "in flight",
+                    fmt_count(tracker.in_flight_len() as u64),
+                    palette::CYAN,
+                );
+                cell(
+                    ui,
+                    "un-mined",
+                    fmt_count(stats.unmined_total),
+                    if stats.unmined_total > 0 {
+                        palette::AMBER
+                    } else {
+                        palette::FAINT
+                    },
+                );
+                cell(
+                    ui,
+                    "dropped",
+                    fmt_count(stats.dropped_expired.saturating_add(stats.dropped_evicted)),
+                    if stats.dropped_expired > 0 {
+                        palette::RED
+                    } else {
+                        palette::FAINT
+                    },
+                );
+            });
+            ui.add_space(6.0);
+
+            let buckets = tracker.buckets();
+            if buckets.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "No inclusion measured yet. A latency appears once a submitted \
+                         transaction is seen in a block — on mainnet that is up to one \
+                         block interval away.",
+                    )
+                    .small()
+                    .color(palette::FAINT),
+                );
+                return;
+            }
+            ui.label(
+                RichText::new("inclusion latency by bid")
+                    .small()
+                    .color(palette::DIM),
+            );
+            egui::Grid::new("confirm-latency")
+                .num_columns(5)
+                .spacing([12.0, 2.0])
+                .show(ui, |ui| {
+                    for h in ["bid", "n", "p50", "p95", "max"] {
+                        ui.label(RichText::new(h).small().color(palette::FAINT));
+                    }
+                    ui.end_row();
+                    for b in buckets {
+                        let Some(l) = tracker.latency(b) else {
+                            continue;
+                        };
+                        ui.label(
+                            RichText::new(self.bucket_label(b))
+                                .monospace()
+                                .small()
+                                .color(palette::TEXT),
+                        );
+                        for v in [
+                            fmt_count(l.count as u64),
+                            fmt_ms(l.p50_ms),
+                            fmt_ms(l.p95_ms),
+                            fmt_ms(l.max_ms),
+                        ] {
+                            ui.label(RichText::new(v).monospace().small().color(palette::TEXT));
+                        }
+                        ui.end_row();
+                    }
+                });
+            if stats.unbucketed_samples > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "{} samples exceeded the tracker's bucket cap and are not shown",
+                        fmt_count(stats.unbucketed_samples)
+                    ))
+                    .small()
+                    .color(palette::AMBER),
+                );
+            }
+        });
+    }
+
+    /// The human label for a tracker bucket key, derived from the run's OWN tip
+    /// policy so the rows name the rungs the operator configured. A key from a
+    /// previous policy (the tracker outlives a run) falls back to the raw key,
+    /// which is honest about not knowing rather than mislabelling it.
+    fn bucket_label(&self, key: confirm::TipBucket) -> String {
+        let Ok(policy) = self.parse_tip_policy() else {
+            return format!("#{key}");
+        };
+        match key {
+            0 => "untipped".to_string(),
+            1 => "<ladder".to_string(),
+            k => match policy.rungs().get(usize::from(k - 2)) {
+                Some(g) => format!("≥{} XUS", grains_to_xus(*g)),
+                None => format!("#{key}"),
+            },
+        }
+    }
+
+    /// Setup card 4 — what each transaction BIDS and what SHAPE it is.
+    ///
+    /// Both default to the cannon's original behavior (untipped bare transfers),
+    /// so opening this card changes nothing until the operator deliberately
+    /// bids or widens the mix. Every input is validated live against the same
+    /// parser the run arms with, so an error is visible before Fire, not after.
+    fn auction_card(&mut self, ui: &mut Ui, running: bool) {
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width() - 4.0);
+            eyebrow(ui, "4 · auction & shape");
+            ui.add_space(4.0);
+            ui.add_enabled_ui(!running, |ui| {
+                // ---- bid ------------------------------------------------
+                ui.label(RichText::new("Priority tip").small().color(palette::DIM));
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.tip_choice,
+                        TipChoice::Untipped,
+                        RichText::new("none").small(),
+                    );
+                    ui.selectable_value(
+                        &mut self.tip_choice,
+                        TipChoice::Fixed,
+                        RichText::new("fixed").small(),
+                    );
+                    ui.selectable_value(
+                        &mut self.tip_choice,
+                        TipChoice::Ladder,
+                        RichText::new("ladder").small(),
+                    );
+                });
+                match self.tip_choice {
+                    TipChoice::Untipped => {
+                        ui.label(
+                            RichText::new(
+                                "Bare actions, no fee-auction envelope — byte-identical to the \
+                                 traffic the cannon fired before the auction existed.",
+                            )
+                            .small()
+                            .color(palette::FAINT),
+                        );
+                    }
+                    TipChoice::Fixed => {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.tip_fixed)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(90.0),
+                            );
+                            ui.label(RichText::new("XUS per tx").small().color(palette::FAINT));
+                        });
+                    }
+                    TipChoice::Ladder => {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.tip_ladder)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("0.00001, 0.00005, 0.00025"),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut self.tip_ladder_random,
+                                false,
+                                RichText::new("round-robin").small(),
+                            );
+                            ui.selectable_value(
+                                &mut self.tip_ladder_random,
+                                true,
+                                RichText::new("random").small(),
+                            );
+                        });
+                        ui.label(
+                            RichText::new(
+                                "A spread of bids in one run. Inclusion latency is reported per \
+                                 rung below, so bid order and inclusion order can be compared \
+                                 directly.",
+                            )
+                            .small()
+                            .color(palette::FAINT),
+                        );
+                    }
+                }
+                if let Err(e) = self.parse_tip_policy() {
+                    ui.label(RichText::new(format!("✖ {e}")).small().color(palette::RED));
+                }
+
+                ui.add_space(6.0);
+                // ---- action mix -----------------------------------------
+                ui.label(RichText::new("Action mix").small().color(palette::DIM));
+                for (i, kind) in ActionKind::ALL.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let mut on = self.mix_weights[i] > 0;
+                        if ui
+                            .checkbox(&mut on, RichText::new(kind.label()).small())
+                            .changed()
+                        {
+                            self.mix_weights[i] = if on { 1 } else { 0 };
+                        }
+                        if self.mix_weights[i] > 0 {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.mix_weights[i])
+                                            .range(1..=1_000u64)
+                                            .speed(0.2),
+                                    )
+                                    .on_hover_text("relative weight");
+                                },
+                            );
+                        }
+                        if kind.has_extra_xus_cost() {
+                            ui.label(RichText::new("costs XUS").small().color(palette::AMBER))
+                                .on_hover_text(
+                                    "Charges a real one-time registration fee to the miner on \
+                                     every draw. Irreversible.",
+                                );
+                        }
+                    });
+                }
+                let uses_symbol = self.mix_weights[1] > 0 || self.mix_weights[2] > 0;
+                if uses_symbol {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("symbol").small().color(palette::DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.mix_symbol)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(90.0),
+                        );
+                    });
+                }
+                if self.mix_weights[2] > 0 {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("NFT padding").small().color(palette::DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.mix_metadata)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(74.0),
+                        );
+                        ui.label(RichText::new("bytes").small().color(palette::FAINT));
+                    })
+                    .response
+                    .on_hover_text(
+                        "Metadata padding dials transaction SIZE, so a run can probe the \
+                         block-space cap rather than only the transaction-count cap.",
+                    );
+                }
+                if self.mix_weights[3] > 0 {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("name prefix").small().color(palette::DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.mix_name_prefix)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(90.0),
+                        );
+                        ui.label(RichText::new("<n>.sov").small().color(palette::FAINT));
+                    });
+                }
+                match self.parse_action_mix() {
+                    Err(e) => {
+                        ui.label(RichText::new(format!("✖ {e}")).small().color(palette::RED));
+                    }
+                    Ok(mix) => {
+                        // Show the EFFECTIVE share, not the raw weight: "2" next
+                        // to "7" means 22%, and an operator should not have to do
+                        // that arithmetic to know what they are about to fire.
+                        let total = mix.total_weight().max(1);
+                        let shares: Vec<String> = ActionKind::ALL
+                            .iter()
+                            .zip(self.mix_weights.iter())
+                            .filter(|(_, w)| **w > 0)
+                            .map(|(k, w)| {
+                                format!("{} {}%", k.label(), (w * 100).saturating_div(total))
+                            })
+                            .collect();
+                        ui.label(
+                            RichText::new(shares.join(" · "))
+                                .small()
+                                .color(palette::FAINT),
+                        );
+                        let costly = mix.costly_kinds();
+                        if !costly.is_empty() {
+                            ui.checkbox(
+                                &mut self.ack_costly_actions,
+                                RichText::new("I accept the extra XUS cost")
+                                    .small()
+                                    .color(palette::AMBER),
+                            )
+                            .on_hover_text(format!(
+                                "{} spends real XUS beyond gas on every draw.",
+                                costly
+                                    .iter()
+                                    .map(|k| k.label())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
+                    }
+                }
+            });
+        });
     }
 
     // ---- centre: telemetry ----------------------------------------------
@@ -2779,8 +3477,9 @@ impl CannonApp {
         let nonce = r(MeterKind::RejNonce);
         let afford = r(MeterKind::RejAfford);
         let other = r(MeterKind::RejOther);
+        let rbf = r(MeterKind::RejRbf);
         let rejected = if ever_ran {
-            cap + nonce + afford + other
+            cap + nonce + afford + rbf + other
         } else {
             f64::NAN
         };
@@ -2788,6 +3487,7 @@ impl CannonApp {
         let t_cap = st.meter.total(MeterKind::RejCapacity);
         let t_nonce = st.meter.total(MeterKind::RejNonce);
         let t_afford = st.meter.total(MeterKind::RejAfford);
+        let t_rbf = st.meter.total(MeterKind::RejRbf);
         let t_other = st.meter.total(MeterKind::RejOther);
 
         // --- 1. headline tiles ------------------------------------------
@@ -2885,6 +3585,9 @@ impl CannonApp {
         }
         ui.add_space(8.0);
 
+        self.confirmations_card(ui);
+        ui.add_space(8.0);
+
         // --- 3. outcome breakdown ---------------------------------------
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width() - 4.0);
@@ -2899,7 +3602,7 @@ impl CannonApp {
                 });
             });
             ui.add_space(4.0);
-            let scale = [attempted, accepted, cap, nonce, afford, other]
+            let scale = [attempted, accepted, cap, nonce, afford, rbf, other]
                 .into_iter()
                 .filter(|v| v.is_finite())
                 .fold(0.0f64, f64::max)
@@ -2955,6 +3658,16 @@ impl CannonApp {
             );
             outcome_row(
                 ui,
+                "⇅",
+                "outbid (RBF)",
+                "our bid did not strictly outbid the tx already in that slot — raise the tip to take it",
+                rbf,
+                t_rbf,
+                share(rbf, scale),
+                palette::AMBER,
+            );
+            outcome_row(
+                ui,
                 "✖",
                 "other / fault",
                 "unclassified rejections and transport errors — the only bucket that means something is wrong",
@@ -2966,8 +3679,9 @@ impl CannonApp {
             ui.add_space(4.0);
             ui.label(
                 RichText::new(
-                    "Only the ✖ row indicates a fault. The three above it are the cannon steering \
-                     itself — holding nonces, resyncing and waiting — and are how it stays gap-free.",
+                    "Only the ✖ row indicates a fault. The four above it are the cannon steering \
+                     itself — holding nonces, resyncing, waiting and re-bidding — and are how it \
+                     stays gap-free.",
                 )
                 .small()
                 .color(palette::FAINT),

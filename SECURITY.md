@@ -51,6 +51,21 @@ key material in memory and about not spending what you did not mean to spend.
 - Recycle mode confines destinations to the unlocked wallets so value cannot
   leave the set, but fees still leave. It bounds the loss, it does not remove
   it.
+- **A priority tip is real XUS paid to a miner, per transaction, and it never
+  comes back** — not even in recycle mode, which confines the *transfer* but not
+  the bid. At firehose rates a tip ladder spends the tip on every accepted
+  transaction. Bidding is therefore opt-in and off by default; the default run
+  is still the untipped traffic the tool fired before the auction existed.
+- **Some action kinds spend beyond gas.** `RegisterName` charges a one-time
+  registration fee to the miner on every draw. The tool refuses to arm a mix
+  containing such a kind until the operator ticks an explicit acknowledgement,
+  and the affected kinds are named in the refusal. That gate is a deliberate
+  safety property: do not remove it to make a run start faster.
+- **The adversarial probes are read-only assertions about the node's rules, but
+  they still submit real transactions** — a nonce-gap probe pays gas for a
+  transaction it expects to be refused. They are biased toward reporting
+  *inconclusive* rather than failure precisely because a live chain has races; a
+  reported mismatch should be reproduced before it is treated as a finding.
 
 ## Change classes that require extra scrutiny
 
