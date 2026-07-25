@@ -6,19 +6,25 @@ license = "Apache-2.0"
 publish = false
 description = "Automated transaction traffic generator for SOV: watches the chain tip and fires signed transfers each new block, from a SOV-Station wallet the user unlocks."
 
-# Standalone tool — intentionally NOT a member of the chain workspace, so it never
-# affects `chain/` builds, tests, or CI. It depends on the real chain crates by path
-# (the same keystore decryption, signing, ids, and RPC client SOV-Station uses — no
-# reimplemented crypto anywhere in this crate).
+# Standalone repository — this crate is NOT a member of the SOV chain workspace and
+# never modifies it. It depends on the real chain crates as GIT dependencies pinned to
+# a released SOV tag (the same keystore decryption, signing, ids, and RPC client
+# SOV-Station uses — no reimplemented crypto anywhere in this crate).
 [[bin]]
 name = "sov-tx-cannon"
 path = "src/main.rs"
 
 [dependencies]
-sov-rpc = { path = "../../chain/crates/rpc" }
-sov-crypto = { path = "../../chain/crates/crypto" }
-sov-types = { path = "../../chain/crates/types" }
-sov-primitives = { path = "../../chain/crates/primitives" }
+# --- SOV chain crates (pinned) ------------------------------------------------
+# Pinned BY TAG, never by branch: the signing, id, and codec rules this tool uses
+# must be a released, reviewed consensus surface, not whatever `main` happens to be.
+# Bumping SOV_CHAIN_TAG is a deliberate, reviewed change — see README.md
+# ("Chain dependency pin"). Keep all four on the SAME tag.
+sov-rpc = { git = "https://github.com/cloudzombie/sov", tag = "v0.2.0" }
+sov-crypto = { git = "https://github.com/cloudzombie/sov", tag = "v0.2.0" }
+sov-types = { git = "https://github.com/cloudzombie/sov", tag = "v0.2.0" }
+sov-primitives = { git = "https://github.com/cloudzombie/sov", tag = "v0.2.0" }
+# ------------------------------------------------------------------------------
 # Native GUI — the same immediate-mode stack as SOV-Station.
 eframe = "0.29"
 # Memory hygiene: passphrase and signing seeds wiped on drop.

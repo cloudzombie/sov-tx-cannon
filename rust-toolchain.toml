@@ -1,0 +1,6 @@
+[toolchain]
+# Must match the toolchain the pinned SOV chain release is built with (SOV CI pins
+# dtolnay/rust-toolchain@1.97.0). Bump this together with the chain tag, never alone.
+channel = "1.97.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The single structural rule of this repository: it consumes the SOV chain
+  # crates as TAGGED git dependencies and never as a path into a local checkout,
+  # a submodule, or a vendored copy of the signing code. Enforce it mechanically
+  # so it cannot rot into a convenience path dependency on someone's laptop.
+  repository-boundaries:
+    name: repository boundaries
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: No path or submodule into a SOV checkout
+        run: |
+          set -euo pipefail
+          if grep -nE '^[[:space:]]*sov-[a-z-]+[[:space:]]*=.*\bpath[[:space:]]*=' Cargo.toml; then
+            echo "SOV chain crates must be tagged git dependencies, never path dependencies." >&2
+            exit 1
+          fi
+          if test -e .gitmodules; then
+            echo "This repository must not use submodules." >&2
+            exit 1
+          fi
+      - name: All four chain crates pinned to the SAME tag
+        run: |
+          set -euo pipefail
+          for crate in sov-rpc sov-crypto sov-types sov-primitives; do
+            line="$(grep -E "^${crate}[[:space:]]*=" Cargo.toml || true)"
+            if test -z "${line}"; then
+              echo "${crate} dependency stanza is missing from Cargo.toml" >&2
+              exit 1
+            fi
+            case "${line}" in
+              *'git = "https://github.com/cloudzombie/sov"'*) ;;
+              *) echo "${crate} must come from https://github.com/cloudzombie/sov" >&2; exit 1 ;;
+            esac
+            tag="$(printf '%s\n' "${line}" | sed -n 's/.*tag[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')"
+            if test -z "${tag}"; then
+              echo "${crate} must be pinned by tag (never a branch or bare rev)" >&2
+              exit 1
+            fi
+            echo "${crate} -> ${tag}"
+            if test -z "${expected:-}"; then expected="${tag}"; fi
+            if test "${tag}" != "${expected}"; then
+              echo "chain crates are pinned to different tags (${tag} != ${expected})" >&2
+              exit 1
+            fi
+          done
+
+  build:
+    name: fmt · clippy · test · build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The Apple Silicon leg exists because the owner runs Apple Silicon. Prove
+      # the runner is really arm64 rather than an emulated or Intel image.
+      - name: Prove native Apple Silicon runner
+        if: matrix.os == 'macos-15'
+        run: test "$(uname -m)" = arm64
+
+      # rust-toolchain.toml pins the channel and the rustfmt/clippy components;
+      # this materializes it before the first cargo invocation so a missing
+      # component fails here with a clear message rather than mid-lint.
+      - name: Install pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      # The pinned chain crates build SOV's RandomX proof-of-work crate, which
+      # compiles native C/C++ and therefore needs CMake; the native GUI needs the
+      # standard egui X11/Wayland development packages on Linux.
+      - name: Install native build dependencies (Linux)
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
+      - name: Install native build dependencies (macOS)
+        if: matrix.os == 'macos-15'
+        run: command -v cmake >/dev/null || brew install cmake
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Lint (deny warnings)
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Build release
+        run: cargo build --locked --release
