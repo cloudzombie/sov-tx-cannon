@@ -436,6 +436,101 @@ impl AmountMode {
     }
 }
 
+/// How much priority tip (in grains) to attach to each transaction, bidding for
+/// earlier inclusion in the blockspace auction (SOV v0.1.98, `Action::Tipped`).
+///
+/// A tip is only ever *applied* when the node reports the `fee-auction` deployment
+/// as `Active` (see [`parse_fee_auction_active`]); while the fork is dormant the
+/// cannon emits the bare inner action, byte-identical to a pre-auction transaction
+/// (see [`transfer_action`]). This type only decides the *bid*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TipMode {
+    /// No tip — a zero-bid (legacy) transaction. It is never rejected for bidding
+    /// zero; under contention it simply waits behind funded bids.
+    Off,
+    /// Always attach exactly this many grains as the tip.
+    Fixed(u128),
+    /// Draw the tip uniformly from `[min, max]` (inclusive) grains, so a fleet of
+    /// wallets spreads a realistic spectrum of bids across the fee floor.
+    Range { min: u128, max: u128 },
+}
+
+impl TipMode {
+    /// Validate the mode's shape (a well-ordered range; any fixed value, including
+    /// zero, is allowed — a zero tip is simply a legacy bid).
+    pub fn validate(&self) -> Result<(), String> {
+        if let TipMode::Range { min, max } = self {
+            if *max < *min {
+                return Err("tip max must be ≥ min".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Pick a concrete tip in grains. `rng` is consulted only for [`TipMode::Range`].
+    pub fn pick(&self, rng: &mut Rng) -> u128 {
+        match self {
+            TipMode::Off => 0,
+            TipMode::Fixed(v) => *v,
+            TipMode::Range { min, max } => {
+                let span = max - min; // max >= min guaranteed by validate
+                min + rng.below(span + 1)
+            }
+        }
+    }
+}
+
+/// Build the [`Action`] a transfer should carry, wrapping it in an
+/// [`Action::Tipped`] envelope ONLY when the blockspace auction is live AND a
+/// nonzero tip is bid. Otherwise the bare `Transfer` is returned — byte-identical
+/// to a pre-auction transaction, so a cannon pointed at a node where the
+/// `fee-auction` fork is still dormant emits exactly what it always did.
+///
+/// This is the whole gate, in one pure, tested place: the worker decides
+/// `auction_active` from the node's `sov_getDeployments`, exactly as SOV-Station
+/// gates the envelope, and never emits a `Tipped` a dormant node would reject.
+pub fn transfer_action(
+    to: AccountId,
+    amount_grains: u128,
+    tip_grains: u128,
+    auction_active: bool,
+) -> Action {
+    let transfer = Action::Transfer {
+        to,
+        amount: Balance::from_grains(amount_grains),
+    };
+    if auction_active && tip_grains > 0 {
+        Action::Tipped {
+            tip: Balance::from_grains(tip_grains),
+            inner: Box::new(transfer),
+        }
+    } else {
+        transfer
+    }
+}
+
+/// Whether the node reports the blockspace-auction (`fee-auction`) deployment as
+/// `Active`, parsed from a `sov_getDeployments` result.
+///
+/// Mirrors how [`RpcClient::signing_domain`] treats an old node: anything other
+/// than an explicit `state == "Active"` for the `fee-auction` deployment reads as
+/// dormant (`false`) — a node too old to report deployments, a malformed answer,
+/// or a fork still `Defined`/`Started`/`LockedIn` all mean "emit the bare action".
+/// Fail-closed: the cannon only ever *adds* a tip when the node has affirmatively
+/// activated the envelope.
+pub fn parse_fee_auction_active(deployments: &serde_json::Value) -> bool {
+    deployments
+        .get("deployments")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter().any(|dep| {
+                dep.get("name").and_then(|n| n.as_str()) == Some("fee-auction")
+                    && dep.get("state").and_then(|s| s.as_str()) == Some("Active")
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// The key scheme a wallet seed derives, mirroring the SOV-Station keystore's
 /// `scheme` field (`"hybrid65"` is the generated default; ed25519 is the legacy /
 /// dev-test scheme).
@@ -487,12 +582,19 @@ pub fn derive_account_id(seed: &[u8; 32], scheme: KeyScheme) -> AccountId {
 /// `sov_getSigningDomain` (`RpcClient::signing_domain`): `None` while the
 /// `tx-domain` fork is dormant (legacy signature, byte-identical to before),
 /// `Some(domain)` once active (network-bound signature).
+///
+/// `tip_grains` + `auction_active` select the action shape via [`transfer_action`]:
+/// a live auction with a nonzero tip produces an `Action::Tipped` envelope; a
+/// dormant fork (or a zero tip) produces the bare `Transfer`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_signed_transfer(
     seed: &[u8; 32],
     scheme: KeyScheme,
     from: &AccountId,
     to: &AccountId,
     amount_grains: u128,
+    tip_grains: u128,
+    auction_active: bool,
     nonce: u64,
     domain: Option<&SigningDomain>,
 ) -> Result<SignedTransaction, String> {
@@ -501,10 +603,7 @@ pub fn build_signed_transfer(
         signer: from.clone(),
         public_key: keypair.public_key(),
         nonce,
-        action: Action::Transfer {
-            to: to.clone(),
-            amount: Balance::from_grains(amount_grains),
-        },
+        action: transfer_action(to.clone(), amount_grains, tip_grains, auction_active),
     };
     SignedTransaction::sign_in(tx, &keypair, domain).map_err(|e| format!("signing failed: {e}"))
     // `keypair` drops here.
@@ -1217,6 +1316,173 @@ mod tests {
         assert!(AmountMode::Range { min: 0, max: 1 }.validate().is_ok());
     }
 
+    // ---- Tip mode + auction gating -------------------------------------
+
+    #[test]
+    fn tip_off_is_always_zero() {
+        let mut rng = Rng::seeded(1);
+        for _ in 0..100 {
+            assert_eq!(TipMode::Off.pick(&mut rng), 0);
+        }
+    }
+
+    #[test]
+    fn tip_fixed_returns_the_fixed_value() {
+        let mode = TipMode::Fixed(5_000);
+        let mut rng = Rng::seeded(7);
+        for _ in 0..100 {
+            assert_eq!(mode.pick(&mut rng), 5_000);
+        }
+    }
+
+    #[test]
+    fn tip_range_stays_within_bounds_inclusive() {
+        let mode = TipMode::Range {
+            min: 1_000,
+            max: 9_000,
+        };
+        mode.validate().unwrap();
+        let mut rng = Rng::seeded(99);
+        let (mut saw_min, mut saw_max) = (false, false);
+        for _ in 0..20_000 {
+            let v = mode.pick(&mut rng);
+            assert!((1_000..=9_000).contains(&v), "tip {v} out of range");
+            saw_min |= v == 1_000;
+            saw_max |= v == 9_000;
+        }
+        assert!(saw_min && saw_max, "both inclusive endpoints reachable");
+    }
+
+    #[test]
+    fn tip_validation_rejects_inverted_range() {
+        assert!(TipMode::Range { min: 10, max: 5 }.validate().is_err());
+        assert!(TipMode::Range { min: 0, max: 0 }.validate().is_ok());
+        assert!(TipMode::Fixed(0).validate().is_ok());
+        assert!(TipMode::Off.validate().is_ok());
+    }
+
+    #[test]
+    fn transfer_action_wraps_only_when_auction_live_and_tip_nonzero() {
+        let to = acct("sink.sov");
+        // Dormant fork: NEVER a Tipped envelope, even with a nonzero bid — the
+        // action is byte-identical to a pre-auction transfer.
+        match transfer_action(to.clone(), 100, 5_000, false) {
+            Action::Transfer { to: t, amount } => {
+                assert_eq!(t, to);
+                assert_eq!(amount, Balance::from_grains(100));
+            }
+            other => panic!("dormant fork must emit a bare Transfer, got {other:?}"),
+        }
+        // Live fork, zero tip: still bare (a zero bid is a legacy transaction).
+        assert!(matches!(
+            transfer_action(to.clone(), 100, 0, true),
+            Action::Transfer { .. }
+        ));
+        // Live fork, nonzero tip: a Tipped envelope carrying the inner Transfer.
+        match transfer_action(to.clone(), 100, 5_000, true) {
+            Action::Tipped { tip, inner } => {
+                assert_eq!(tip, Balance::from_grains(5_000));
+                match *inner {
+                    Action::Transfer { to: t, amount } => {
+                        assert_eq!(t, to);
+                        assert_eq!(amount, Balance::from_grains(100));
+                    }
+                    other => panic!("inner must be the Transfer, got {other:?}"),
+                }
+            }
+            other => panic!("live auction + tip must emit Tipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tipped_transfer_builds_signs_and_verifies() {
+        // A tipped envelope from the real signing path verifies and carries the tip.
+        let seed = [4u8; 32];
+        let from = acct("cannon.sov");
+        let to = acct("target.sov");
+        let stx = build_signed_transfer(
+            &seed,
+            KeyScheme::Ed25519,
+            &from,
+            &to,
+            42_000,
+            7_000, // tip
+            true,  // auction active
+            3,
+            None,
+        )
+        .unwrap();
+        assert!(stx.verify_signature(), "tipped tx signature must verify");
+        match &stx.transaction.action {
+            Action::Tipped { tip, inner } => {
+                assert_eq!(*tip, Balance::from_grains(7_000));
+                assert!(matches!(**inner, Action::Transfer { .. }));
+            }
+            other => panic!("expected Tipped, got {other:?}"),
+        }
+        // Same inputs but a dormant fork: the SAME bytes as an untipped transfer,
+        // proving the cannon never changes the wire form until the fork is live.
+        let dormant = build_signed_transfer(
+            &seed,
+            KeyScheme::Ed25519,
+            &from,
+            &to,
+            42_000,
+            7_000, // tip requested…
+            false, // …but auction dormant ⇒ ignored
+            3,
+            None,
+        )
+        .unwrap();
+        let untipped = build_signed_transfer(
+            &seed,
+            KeyScheme::Ed25519,
+            &from,
+            &to,
+            42_000,
+            0,
+            false,
+            3,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            borsh::to_vec(&dormant).unwrap(),
+            borsh::to_vec(&untipped).unwrap(),
+            "a dormant fork must emit byte-identical (untipped) transactions"
+        );
+    }
+
+    #[test]
+    fn fee_auction_gate_reads_only_an_active_deployment() {
+        use serde_json::json;
+        // Active ⇒ true (the one shape that lets a tip be attached).
+        let active = json!({
+            "height": 11_600,
+            "deployments": [
+                {"name": "tx-domain", "state": "Active"},
+                {"name": "fee-auction", "state": "Active"},
+            ]
+        });
+        assert!(parse_fee_auction_active(&active));
+
+        // Every non-Active state reads as dormant — fail-closed.
+        for state in ["Defined", "Started", "LockedIn", "Failed"] {
+            let v = json!({"deployments": [{"name": "fee-auction", "state": state}]});
+            assert!(
+                !parse_fee_auction_active(&v),
+                "state {state} must not activate tips"
+            );
+        }
+        // fee-auction absent ⇒ dormant (an older node signalling only tx-domain).
+        let only_txd = json!({"deployments": [{"name": "tx-domain", "state": "Active"}]});
+        assert!(!parse_fee_auction_active(&only_txd));
+        // A node too old to report deployments at all ⇒ dormant.
+        assert!(!parse_fee_auction_active(&json!({})));
+        assert!(!parse_fee_auction_active(&json!({"deployments": []})));
+        assert!(!parse_fee_auction_active(&json!("garbage")));
+    }
+
     // ---- Tx construction + signing -------------------------------------
 
     #[test]
@@ -1248,8 +1514,18 @@ mod tests {
         let seed = [7u8; 32];
         let from = acct("cannon.sov");
         let to = acct("target.sov");
-        let stx =
-            build_signed_transfer(&seed, KeyScheme::Ed25519, &from, &to, 42_000, 9, None).unwrap();
+        let stx = build_signed_transfer(
+            &seed,
+            KeyScheme::Ed25519,
+            &from,
+            &to,
+            42_000,
+            0,
+            false,
+            9,
+            None,
+        )
+        .unwrap();
 
         // Signature verifies against the committed public key.
         assert!(stx.verify_signature(), "signature must verify");
@@ -1282,6 +1558,8 @@ mod tests {
             &from,
             &to,
             42_000,
+            0,
+            false,
             9,
             Some(&domain),
         )
@@ -1289,8 +1567,18 @@ mod tests {
         assert!(bound.verify_signature_in(Some(&domain)));
         assert!(!bound.verify_signature(), "bound sig must NOT pass legacy");
         // The tx id is domain-independent (hash of the un-framed body).
-        let legacy =
-            build_signed_transfer(&seed, KeyScheme::Ed25519, &from, &to, 42_000, 9, None).unwrap();
+        let legacy = build_signed_transfer(
+            &seed,
+            KeyScheme::Ed25519,
+            &from,
+            &to,
+            42_000,
+            0,
+            false,
+            9,
+            None,
+        )
+        .unwrap();
         assert_eq!(bound.id(), legacy.id());
     }
 
@@ -1303,6 +1591,8 @@ mod tests {
             &acct("cannon.sov"),
             &acct("target.sov"),
             1,
+            0,
+            false,
             0,
             None,
         )
