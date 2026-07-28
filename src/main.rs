@@ -30,6 +30,7 @@
 //! nothing secret is ever written to disk or logged.
 
 mod logic;
+mod redteam;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,11 +45,12 @@ use sov_rpc::{Keystore, RpcClient};
 
 use logic::{
     build_signed_transfer, classify_reject, derive_account_id, disposition, first_blocker,
-    fmt_count, fmt_elapsed, fmt_pct, fmt_rate, grains_to_xus, nice_ceiling, parse_xus, scope_x,
-    scope_x_age, scope_y, share, AmountMode, DestMode, DestSelector, Disposition, KeyScheme,
-    MeterKind, NonceSequencer, Pacer, Pressure, RateMeter, RateMode, RejectClass, Rng,
-    SCOPE_GAP_MS, SCOPE_WINDOW_SECS,
+    fmt_count, fmt_elapsed, fmt_pct, fmt_rate, grains_to_xus, nice_ceiling,
+    parse_fee_auction_active, parse_xus, scope_x, scope_x_age, scope_y, share, AmountMode,
+    DestMode, DestSelector, Disposition, KeyScheme, MeterKind, NonceSequencer, Pacer, Pressure,
+    RateMeter, RateMode, RejectClass, Rng, TipMode, SCOPE_GAP_MS, SCOPE_WINDOW_SECS,
 };
+use redteam::ProbeReport;
 
 /// Default node RPC endpoint (SOV-Station's node default).
 const DEFAULT_RPC: &str = "127.0.0.1:8645";
@@ -373,6 +375,12 @@ struct Conn {
     tip: u64,
     /// Last observed mempool depth.
     mempool: Option<u64>,
+    /// The node's chain id (e.g. `sov-mainnet`), once observed. Names the network
+    /// the operator is pointed at — load-bearing before any LIVE FIRE.
+    chain_id: Option<String>,
+    /// Whether the node reports the `fee-auction` (blockspace-auction) deployment
+    /// Active. `None` until first observed; drives the tip UI's live/dormant hint.
+    auction_active: Option<bool>,
     /// The error text from the last failed probe (empty when ok).
     error: String,
     /// When the last SUCCESSFUL probe completed — the heartbeat. The indicator
@@ -433,6 +441,10 @@ struct WorkerConfig {
     dests: Vec<AccountId>,
     dest_mode: DestMode,
     amount_mode: AmountMode,
+    /// The blockspace-auction tip to bid per transaction. Only ever *applied* when
+    /// the node reports the `fee-auction` deployment Active (see
+    /// [`WorkerState::auction_active`]); dormant, the worker emits the bare action.
+    tip_mode: TipMode,
     /// The rate mode with any per-worker share already applied (Target TX/s is
     /// split across the selected wallets).
     mode: RateMode,
@@ -484,6 +496,14 @@ struct CannonApp {
     amount_fixed: String,
     amount_min: String,
     amount_max: String,
+    // Blockspace-auction bid (v0.1.98 `Action::Tipped`). Applied only when the node
+    // reports the `fee-auction` deployment Active; dormant, the tx is byte-identical
+    // to a pre-auction transfer regardless of these fields.
+    tip_on: bool,
+    tip_random: bool,
+    tip_fixed: String,
+    tip_min: String,
+    tip_max: String,
     mode: ModeChoice,
     rate: String,
     tps: String,
@@ -517,6 +537,15 @@ struct CannonApp {
     log_errors_only: bool,
     /// Setup column collapsed to give the telemetry the full width.
     setup_open: bool,
+
+    // ---- Adversarial "prove the defenses hold" mode ----
+    /// The latest battery report, published by the background probe thread.
+    adv_report: Arc<Mutex<Option<ProbeReport>>>,
+    /// The running probe thread (one-shot), reaped when it finishes.
+    adv_handle: Option<thread::JoinHandle<()>>,
+    /// The typed mainnet confirmation. Empty by default: the battery will NOT fire
+    /// at a mainnet node until this exactly matches [`redteam::MAINNET_CONFIRM_PHRASE`].
+    adv_confirm: String,
 }
 
 /// What a finished run did — kept so "stopped" is a result, not a blank screen.
@@ -544,6 +573,11 @@ impl Default for CannonApp {
             amount_fixed: "0.001".to_string(),
             amount_min: "0.001".to_string(),
             amount_max: "0.01".to_string(),
+            tip_on: false,
+            tip_random: false,
+            tip_fixed: "0.00001".to_string(),
+            tip_min: "0.00001".to_string(),
+            tip_max: "0.0001".to_string(),
             mode: ModeChoice::PerBlock,
             rate: "1".to_string(),
             tps: "2".to_string(),
@@ -561,6 +595,9 @@ impl Default for CannonApp {
             last_run: None,
             log_errors_only: false,
             setup_open: true,
+            adv_report: Arc::new(Mutex::new(None)),
+            adv_handle: None,
+            adv_confirm: String::new(),
         }
     }
 }
@@ -732,6 +769,25 @@ impl CannonApp {
         Ok(mode)
     }
 
+    /// Parse + validate the tip mode from the UI fields. `TipMode::Off` when tips
+    /// are toggled off — the cannon then behaves exactly as it did before tips
+    /// existed. Amounts are read in XUS and stored as grains, like transfer amounts.
+    fn parse_tip_mode(&self) -> Result<TipMode, String> {
+        if !self.tip_on {
+            return Ok(TipMode::Off);
+        }
+        let mode = if self.tip_random {
+            let min = parse_xus(&self.tip_min).ok_or("tip min is not a valid XUS value")?;
+            let max = parse_xus(&self.tip_max).ok_or("tip max is not a valid XUS value")?;
+            TipMode::Range { min, max }
+        } else {
+            let v = parse_xus(&self.tip_fixed).ok_or("tip is not a valid XUS value")?;
+            TipMode::Fixed(v)
+        };
+        mode.validate()?;
+        Ok(mode)
+    }
+
     /// Parse + validate the rate mode from the UI fields. `n_workers` is how
     /// many wallets will fire: Target TX/s is split evenly across them so the
     /// AGGREGATE rate matches what the user typed.
@@ -783,6 +839,13 @@ impl CannonApp {
                 return None;
             }
         };
+        let tip_mode = match self.parse_tip_mode() {
+            Ok(m) => m,
+            Err(e) => {
+                self.config_msg = e;
+                return None;
+            }
+        };
         let mode = match self.parse_rate_mode(selected.len()) {
             Ok(m) => m,
             Err(e) => {
@@ -812,6 +875,7 @@ impl CannonApp {
                     dests: dests.clone(),
                     dest_mode,
                     amount_mode,
+                    tip_mode,
                     mode,
                     dry_run: self.dry_run,
                 }
@@ -888,6 +952,40 @@ impl CannonApp {
         self.config_msg.clear();
     }
 
+    /// True while the one-shot adversarial battery thread is in flight.
+    fn adv_running(&self) -> bool {
+        self.adv_handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    /// Launch the adversarial "prove the defenses hold" battery against the current
+    /// node on a background thread. The battery reuses throwaway keys only, submits
+    /// exclusively hostile payloads (each rejected before admission), and reads the
+    /// mempool size before/after to prove nothing landed. The mainnet guard lives
+    /// inside [`redteam::run_probe`]: on a mainnet node it fires only when the typed
+    /// confirmation matches, otherwise it returns a `blocked` report and submits
+    /// nothing.
+    fn run_adversarial(&mut self, ctx: &egui::Context) {
+        if self.adv_running() {
+            return;
+        }
+        let addr = self.rpc_addr.clone();
+        let confirmed = redteam::confirmation_ok(&self.adv_confirm);
+        let report = self.adv_report.clone();
+        // Clear the previous report so the panel reads "running", not stale.
+        if let Ok(mut r) = report.lock() {
+            *r = None;
+        }
+        let ctx = ctx.clone();
+        self.adv_handle = Some(thread::spawn(move || {
+            let client = RpcClient::new(addr.clone()).with_timeout(Duration::from_secs(12));
+            let result = redteam::run_probe(&client, addr, confirmed);
+            if let Ok(mut r) = report.lock() {
+                *r = Some(result);
+            }
+            ctx.request_repaint();
+        }));
+    }
+
     /// One-line description of the configured rate mode and its parameter,
     /// exactly as it will be (or was) applied.
     fn mode_summary(&self) -> String {
@@ -919,6 +1017,10 @@ impl Drop for CannonApp {
         }
         // Wait out any background stop-joins so their workers' seeds finish wiping.
         for h in self.draining.drain(..) {
+            let _ = h.join();
+        }
+        // Join the adversarial probe thread if one is still running.
+        if let Some(h) = self.adv_handle.take() {
             let _ = h.join();
         }
         // Signal the always-on connection monitor to exit (keyless; detached).
@@ -958,6 +1060,13 @@ fn run_conn_monitor(
         let height = client.height();
         let latency = probe_started.elapsed();
         let depth = height.is_ok().then(|| client.mempool_size().ok()).flatten();
+        // Identity + auction state: only queried on a reachable node, and only
+        // stored on a definitive answer so a flaky link never clears a known value.
+        let chain_id = height.is_ok().then(|| client.chain_id().ok()).flatten();
+        let auction = height
+            .is_ok()
+            .then(|| fee_auction_active(&client))
+            .flatten();
         // Keep the (Copy) height for the history sample; the error text is moved
         // into the connection view below.
         let height_ok = height.as_ref().ok().copied();
@@ -968,6 +1077,12 @@ fn run_conn_monitor(
                     c.ok = true;
                     c.tip = h;
                     c.mempool = depth.map(|d| d as u64);
+                    if let Some(id) = chain_id {
+                        c.chain_id = Some(id);
+                    }
+                    if let Some(active) = auction {
+                        c.auction_active = Some(active);
+                    }
                     c.error.clear();
                     c.beat_at = Some(Instant::now());
                     c.latency_ms = latency.as_millis() as u64;
@@ -1017,6 +1132,11 @@ struct WorkerState {
     /// (network-bound signing). Refreshed on each node reconcile so a cannon
     /// running across the activation switches over automatically.
     domain: Option<sov_primitives::SigningDomain>,
+    /// Whether the node reports the `fee-auction` deployment Active — refreshed on
+    /// each reconcile. Gates whether a bid becomes an `Action::Tipped` envelope or
+    /// the bare action: a cannon spanning the activation starts tipping by itself,
+    /// and never emits a tip a dormant node would reject.
+    auction_active: bool,
 }
 
 /// The firing worker for ONE wallet: owns a `Zeroizing` copy of that wallet's
@@ -1055,6 +1175,7 @@ fn run_worker(
         known_balance: None,
         height: 0,
         domain: None,
+        auction_active: false,
     };
 
     match cfg.mode {
@@ -1220,8 +1341,27 @@ fn sync_with_node(cfg: &WorkerConfig, ws: &mut WorkerState, status: &Arc<Mutex<S
     if let Ok(domain) = ws.client.signing_domain() {
         ws.domain = domain;
     }
+    // Refresh the fee-auction activation only on a definitive answer, for the same
+    // reason: a transient RPC failure must not flip a tipping worker back to the
+    // bare action mid-run. A node too old to report deployments reads as dormant.
+    if let Some(active) = fee_auction_active(&ws.client) {
+        ws.auction_active = active;
+    }
     publish_wallet_stat(cfg, ws, status, None);
     true
+}
+
+/// Whether the node reports the `fee-auction` (blockspace-auction) deployment as
+/// Active, via `sov_getDeployments`. `Some(active)` on a definitive answer,
+/// `None` on a transport failure (so the caller keeps its last known value rather
+/// than flipping on a flaky link). Parsing lives in [`parse_fee_auction_active`].
+fn fee_auction_active(client: &RpcClient) -> Option<bool> {
+    match client.call("sov_getDeployments", serde_json::json!({})) {
+        Ok(v) => Some(parse_fee_auction_active(&v)),
+        // An old node without the method is, by definition, pre-auction ⇒ dormant.
+        Err(sov_rpc::RpcClientError::Rpc { code: -32601, .. }) => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// A per-wallet condition worth surfacing in the wallet table.
@@ -1279,20 +1419,27 @@ fn fire_once(
 ) -> FireResult {
     let to = ws.selector.next(&mut ws.rng);
     let amount = cfg.amount_mode.pick(&mut ws.rng);
+    // The auction bid. Consume rng deterministically each fire, but only RESERVE
+    // and ATTACH it when the fork is live — a dormant node emits the bare action.
+    let tip = cfg.tip_mode.pick(&mut ws.rng);
+    let effective_tip = if ws.auction_active { tip } else { 0 };
     let nonce = ws.seq.peek();
+
+    // What this send commits to the signer's balance: the transfer, the intrinsic
+    // fee, and (once the auction is live) the tip paid to the miner.
+    let reserve = amount
+        .saturating_add(FEE_ESTIMATE_GRAINS)
+        .saturating_add(effective_tip);
 
     // Local affordability pre-check (the node's mempool is the real gate). A shortfall
     // is NOT fatal: pending txs from a previous run release the balance as they mine
     // (closed-loop recycle returns it outright) — refresh from the node and wait.
     if let Some(bal) = ws.known_balance {
-        if bal < amount.saturating_add(FEE_ESTIMATE_GRAINS) {
+        if bal < reserve {
             if let Ok(fresh) = ws.client.balance(&cfg.from) {
                 ws.known_balance = Some(fresh.grains());
             }
-            if ws
-                .known_balance
-                .is_some_and(|b| b < amount.saturating_add(FEE_ESTIMATE_GRAINS))
-            {
+            if ws.known_balance.is_some_and(|b| b < reserve) {
                 let detail = format!(
                     "balance {} XUS can't cover {} XUS + fee — waiting for pending txs to mine",
                     grains_to_xus(ws.known_balance.unwrap_or(0)),
@@ -1311,6 +1458,8 @@ fn fire_once(
         &cfg.from,
         &to,
         amount,
+        tip,
+        ws.auction_active,
         nonce,
         ws.domain.as_ref(),
     ) {
@@ -1346,7 +1495,7 @@ fn fire_once(
         );
         // Optimistically debit our local balance view so the affordability
         // pre-check reflects the spend even without a live submit.
-        debit(ws, amount);
+        debit(ws, amount, effective_tip);
         publish_wallet_stat(cfg, ws, status, None);
         return FireResult::Continue;
     }
@@ -1367,7 +1516,7 @@ fn fire_once(
                 true,
                 &format!("submitted {}", short_hash(&txid.to_hex())),
             );
-            debit(ws, amount);
+            debit(ws, amount, effective_tip);
             publish_wallet_stat(cfg, ws, status, None);
             FireResult::Continue
         }
@@ -1429,10 +1578,14 @@ fn fire_once(
     }
 }
 
-/// Debit the local balance view by amount + estimated fee (pre-check only).
-fn debit(ws: &mut WorkerState, amount: u128) {
+/// Debit the local balance view by amount + estimated fee + tip (pre-check only).
+fn debit(ws: &mut WorkerState, amount: u128, tip: u128) {
     if let Some(b) = ws.known_balance.as_mut() {
-        *b = b.saturating_sub(amount.saturating_add(FEE_ESTIMATE_GRAINS));
+        *b = b.saturating_sub(
+            amount
+                .saturating_add(FEE_ESTIMATE_GRAINS)
+                .saturating_add(tip),
+        );
     }
 }
 
@@ -1971,6 +2124,8 @@ struct ConnView {
     fresh: bool,
     tip: u64,
     mempool: Option<u64>,
+    chain_id: Option<String>,
+    is_mainnet: bool,
     latency_ms: u64,
     beat_age: Option<u64>,
     error: String,
@@ -2013,6 +2168,12 @@ impl eframe::App for CannonApp {
         }
         // Reap finished background stop-join threads.
         self.draining.retain(|h| !h.is_finished());
+        // Reap the one-shot adversarial probe thread once it has published.
+        if self.adv_handle.as_ref().is_some_and(|h| h.is_finished()) {
+            if let Some(h) = self.adv_handle.take() {
+                let _ = h.join();
+            }
+        }
 
         // --- frame-local snapshots (locks released before any drawing) -----
         let conn = match self.conn.lock() {
@@ -2022,6 +2183,12 @@ impl eframe::App for CannonApp {
                 fresh: c.beat_at.is_some_and(|t| t.elapsed() < HEARTBEAT_FRESH),
                 tip: c.tip,
                 mempool: c.mempool,
+                chain_id: c.chain_id.clone(),
+                is_mainnet: c
+                    .chain_id
+                    .as_deref()
+                    .map(redteam::is_mainnet)
+                    .unwrap_or(false),
                 latency_ms: c.latency_ms,
                 beat_age: c.beat_at.map(|t| t.elapsed().as_secs()),
                 error: c.error.clone(),
@@ -2032,6 +2199,8 @@ impl eframe::App for CannonApp {
                 fresh: false,
                 tip: 0,
                 mempool: None,
+                chain_id: None,
+                is_mainnet: false,
                 latency_ms: 0,
                 beat_age: None,
                 error: "connection state unavailable".into(),
@@ -2115,6 +2284,8 @@ impl eframe::App for CannonApp {
                             ui.add_space(8.0);
                         }
                         self.telemetry(ui, &conn, state);
+                        ui.add_space(8.0);
+                        self.adversarial_card(ui, &conn, running);
                     });
             });
     }
@@ -2176,6 +2347,27 @@ impl CannonApp {
                                 .strong()
                                 .color(color),
                         );
+                        // Which network — load-bearing before any LIVE FIRE. Mainnet
+                        // is drawn in the caution color so it can never be mistaken.
+                        if let Some(id) = &conn.chain_id {
+                            let net_color = if conn.is_mainnet {
+                                palette::AMBER
+                            } else {
+                                palette::DIM
+                            };
+                            ui.label(
+                                RichText::new(id)
+                                    .monospace()
+                                    .small()
+                                    .strong()
+                                    .color(net_color),
+                            )
+                            .on_hover_text(if conn.is_mainnet {
+                                "MAINNET — live-fire spends real fees; adversarial mode requires typed confirmation"
+                            } else {
+                                "the network this node reports"
+                            });
+                        }
                         ui.label(
                             RichText::new(&self.rpc_addr)
                                 .monospace()
@@ -2746,6 +2938,81 @@ impl CannonApp {
                 if let Err(e) = self.parse_amount_mode() {
                     ui.label(RichText::new(format!("✖ {e}")).small().color(palette::RED));
                 }
+
+                // --- blockspace-auction tip -----------------------------
+                ui.separator();
+                let auction = self.conn.lock().ok().and_then(|c| c.auction_active);
+                ui.checkbox(
+                    &mut self.tip_on,
+                    RichText::new("⛽ Attach auction tip").small(),
+                )
+                .on_hover_text(
+                    "Bid a priority tip to the block's miner (SOV v0.1.98 Action::Tipped), \
+                     exercising the blockspace auction, dynamic fee floor and RBF. The tip is \
+                     ONLY attached when the node reports the fee-auction fork Active; while it is \
+                     dormant the cannon emits a byte-identical untipped transaction.",
+                );
+                if self.tip_on {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("tip").small().color(palette::DIM));
+                        ui.radio_value(
+                            &mut self.tip_random,
+                            false,
+                            RichText::new("fixed").small(),
+                        );
+                        ui.radio_value(
+                            &mut self.tip_random,
+                            true,
+                            RichText::new("range (spreads the fee floor)").small(),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        if self.tip_random {
+                            ui.label(RichText::new("min").small().color(palette::DIM));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.tip_min)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(74.0),
+                            );
+                            ui.label(RichText::new("max").small().color(palette::DIM));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.tip_max)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(74.0),
+                            );
+                        } else {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.tip_fixed)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(90.0),
+                            );
+                        }
+                        ui.label(RichText::new("XUS tip").small().color(palette::FAINT));
+                    });
+                    if let Err(e) = self.parse_tip_mode() {
+                        ui.label(RichText::new(format!("✖ {e}")).small().color(palette::RED));
+                    }
+                    // Honest about what the node will actually do with the bid.
+                    let (hint, color) = match auction {
+                        Some(true) => (
+                            "fee-auction is ACTIVE on this node — tips are attached and bid for inclusion."
+                                .to_string(),
+                            palette::GREEN,
+                        ),
+                        Some(false) => (
+                            "fee-auction is DORMANT on this node — tips are configured but NOT attached; \
+                             transactions stay byte-identical to untipped until the fork activates."
+                                .to_string(),
+                            palette::AMBER,
+                        ),
+                        None => (
+                            "fee-auction state unknown (node not answering sov_getDeployments yet)."
+                                .to_string(),
+                            palette::FAINT,
+                        ),
+                    };
+                    ui.label(RichText::new(hint).small().color(color));
+                }
             });
         });
         ui.add_space(8.0);
@@ -3139,6 +3406,276 @@ impl CannonApp {
                     }
                 });
         });
+    }
+}
+
+impl CannonApp {
+    // ---- the adversarial "prove the defenses hold" battery ---------------
+    fn adversarial_card(&mut self, ui: &mut Ui, conn: &ConnView, firing: bool) {
+        card_frame()
+            .stroke(Stroke::new(1.0, palette::LINE))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 4.0);
+                ui.horizontal(|ui| {
+                    eyebrow(ui, "prove the defenses hold");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.adv_running() {
+                            ui.label(
+                                RichText::new("◐ firing battery…")
+                                    .small()
+                                    .monospace()
+                                    .color(palette::AMBER),
+                            );
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(
+                        "Fires a fixed battery of HOSTILE, malformed transactions at the node over \
+                         sov_submitTransaction and proves each is refused BEFORE admission — the \
+                         mempool must not grow. Throwaway keys only; nothing of yours is spent. \
+                         Watch every attack bounce while the scope above stays flat.",
+                    )
+                    .small()
+                    .color(palette::FAINT),
+                );
+
+                // Mainnet guard: hostile bytes at the live chain need a typed OK.
+                if conn.is_mainnet {
+                    ui.add_space(4.0);
+                    egui::Frame::none()
+                        .fill(palette::RED.gamma_multiply(0.12))
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "⚠ This node reports MAINNET ({}). The battery will not fire \
+                                     here until you type the confirmation phrase exactly.",
+                                    conn.chain_id.as_deref().unwrap_or("mainnet")
+                                ))
+                                .small()
+                                .strong()
+                                .color(palette::RED),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "type: {}",
+                                        redteam::MAINNET_CONFIRM_PHRASE
+                                    ))
+                                    .small()
+                                    .monospace()
+                                    .color(palette::DIM),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.adv_confirm)
+                                        .hint_text(redteam::MAINNET_CONFIRM_PHRASE)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(200.0),
+                                );
+                            });
+                        });
+                }
+
+                ui.add_space(6.0);
+                // The run button, with an honest reason whenever it is disabled.
+                let confirmed = redteam::confirmation_ok(&self.adv_confirm);
+                let mainnet_block = conn.is_mainnet && !confirmed;
+                let disabled_reason = if firing {
+                    Some("stop the traffic run first — a live run would confuse the residue check")
+                } else if self.adv_running() {
+                    Some("battery already running")
+                } else if !conn.ok {
+                    Some("the node is not answering")
+                } else if mainnet_block {
+                    Some("type the mainnet confirmation phrase above to arm")
+                } else {
+                    None
+                };
+                let btn = egui::Button::new(
+                    RichText::new("⚔  RUN ADVERSARIAL BATTERY")
+                        .monospace()
+                        .strong()
+                        .color(if disabled_reason.is_none() {
+                            Color32::BLACK
+                        } else {
+                            palette::FAINT
+                        }),
+                )
+                .fill(if disabled_reason.is_none() {
+                    palette::AMBER
+                } else {
+                    palette::SURFACE_HI
+                })
+                .min_size(Vec2::new(260.0, 32.0));
+                let resp = ui.add_enabled(disabled_reason.is_none(), btn);
+                if resp.clicked() {
+                    self.run_adversarial(ui.ctx());
+                }
+                if let Some(reason) = disabled_reason {
+                    ui.label(RichText::new(reason).small().color(palette::FAINT));
+                }
+
+                // The verdict + per-attack breakdown.
+                ui.add_space(6.0);
+                let report = self.adv_report.lock().ok().and_then(|r| r.clone());
+                match report {
+                    None if self.adv_running() => {
+                        ui.label(
+                            RichText::new("firing the battery and reading the mempool…")
+                                .small()
+                                .color(palette::DIM),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("no battery run yet")
+                                .small()
+                                .color(palette::FAINT),
+                        );
+                    }
+                    Some(r) => draw_adversarial_report(ui, &r),
+                }
+            });
+        ui.add_space(8.0);
+    }
+}
+
+/// Render a completed (or blocked) adversarial battery report.
+fn draw_adversarial_report(ui: &mut Ui, r: &ProbeReport) {
+    use redteam::Verdict;
+
+    // Headline verdict.
+    let (glyph, word, color, detail): (&str, &str, Color32, String) = if r.blocked {
+        (
+            "◇",
+            "BLOCKED",
+            palette::AMBER,
+            "mainnet, unconfirmed — nothing was fired".into(),
+        )
+    } else if !r.reachable {
+        (
+            "✖",
+            "UNREACHABLE",
+            palette::RED,
+            "the node did not answer — no battery ran".into(),
+        )
+    } else if r.residue_detected() {
+        (
+            "✖",
+            "RESIDUE — INVESTIGATE",
+            palette::RED,
+            "the mempool GREW across the battery: something was admitted".into(),
+        )
+    } else if r.passed() {
+        let (defended, _, _) = r.counts();
+        (
+            "✔",
+            "DEFENSES HELD",
+            palette::GREEN,
+            format!("all {defended} attacks refused before admission · no residue"),
+        )
+    } else {
+        let (_, vuln, info) = r.counts();
+        (
+            "✖",
+            "FAILED",
+            palette::RED,
+            format!("{vuln} admitted, {info} unreached — not a clean pass"),
+        )
+    };
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("{glyph} {word}"))
+                .monospace()
+                .strong()
+                .size(15.0)
+                .color(color),
+        );
+        ui.label(RichText::new(detail).small().color(palette::DIM));
+    });
+
+    // The no-residue read: mempool before → after, the flat line in words.
+    let residue_line = match (r.mempool_before, r.mempool_after) {
+        (Some(b), Some(a)) => {
+            if a <= b {
+                (
+                    format!("mempool {b} → {a}  ·  FLAT — no attack landed"),
+                    palette::GREEN,
+                )
+            } else {
+                (
+                    format!("mempool {b} → {a}  ·  GREW by {}", a - b),
+                    palette::RED,
+                )
+            }
+        }
+        _ if r.blocked || !r.reachable => ("mempool not sampled".to_string(), palette::FAINT),
+        _ => (
+            "mempool size unavailable — cannot prove no residue".to_string(),
+            palette::AMBER,
+        ),
+    };
+    ui.label(
+        RichText::new(residue_line.0)
+            .small()
+            .monospace()
+            .color(residue_line.1),
+    );
+    if let Some(id) = &r.chain_id {
+        ui.label(
+            RichText::new(format!(
+                "target {} · {}",
+                r.target,
+                if r.is_mainnet { "MAINNET" } else { id.as_str() }
+            ))
+            .small()
+            .monospace()
+            .color(palette::FAINT),
+        );
+    }
+
+    // Per-attack outcomes, grouped nowhere — just listed in fired order so the
+    // stream of rejections reads like a log of the door holding.
+    if !r.outcomes.is_empty() {
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical()
+            .id_salt("adv-outcomes")
+            .max_height(220.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for o in &r.outcomes {
+                    let (g, c) = match o.verdict {
+                        Verdict::Defended => ("✔", palette::GREEN),
+                        Verdict::Vulnerable => ("✖", palette::RED),
+                        Verdict::Info => ("○", palette::AMBER),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(g).monospace().small().color(c));
+                        ui.label(
+                            RichText::new(format!("{:<8}", o.category))
+                                .monospace()
+                                .small()
+                                .color(palette::FAINT),
+                        );
+                        ui.label(
+                            RichText::new(format!("{:<44}", truncate(o.name, 44)))
+                                .monospace()
+                                .small()
+                                .color(palette::TEXT),
+                        );
+                        ui.label(RichText::new(&o.detail).small().color(
+                            if o.verdict == Verdict::Vulnerable {
+                                palette::RED
+                            } else {
+                                palette::DIM
+                            },
+                        ));
+                    });
+                }
+            });
     }
 }
 

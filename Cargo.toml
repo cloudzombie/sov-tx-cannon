@@ -33,6 +33,11 @@ zeroize = "1"
 getrandom = "0.2"
 # Decoding the keystore's hex seed fields (matches the workspace's hex version).
 hex = "0.4"
+# JSON — already in the tree via sov-rpc; used for the fee-auction deployment gate
+# and to express the adversarial raw-payload attacks (malformed protocol) exactly as
+# the reference live probe does. No new heavy dependency: it is a transitive dep made
+# direct.
+serde_json = "1"
 
 [dev-dependencies]
 # The unit tests assert a built+signed tx round-trips through the same Borsh

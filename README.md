@@ -38,11 +38,23 @@ repository boundary is stated in [AGENTS.md](AGENTS.md).
   - *Firehose* — submit as fast as sign-and-POST allows; mempool capacity
     rejections are the only brake, and the cannon holds and retries the **same**
     nonce on those, self-pacing to the node's drain rate.
+- **Blockspace-auction tips.** Optionally attach a priority tip to each
+  transaction (SOV v0.1.98 `Action::Tipped`), fixed or drawn from a range so a
+  fleet spreads a realistic spectrum of bids across the dynamic fee floor. The
+  tip is **only** attached when the node reports the `fee-auction` deployment
+  `Active` (queried via `sov_getDeployments`, exactly as SOV Station gates the
+  envelope); while the fork is dormant the cannon emits a byte-identical untipped
+  transaction, so the same configuration is safe across the activation.
 - **Parallel wallets.** One worker per unlocked wallet, each with its own
   gap-free nonce sequencer and its own zeroizing copy of the signing seed.
 - **Live operator telemetry.** Attempted / accepted / rejected per second, a
   rejection breakdown mapped from the node's real reject strings, mempool depth
-  with a saturation flag, and a rolling throughput scope.
+  with a saturation flag, a rolling throughput scope, and the network id the node
+  reports (mainnet is flagged in the caution color).
+- **"Prove the defenses hold" adversarial mode.** A dedicated one-shot battery
+  that fires HOSTILE, malformed transactions at the node over
+  `sov_submitTransaction` and proves each is refused *before* admission — see
+  [Adversarial mode](#adversarial-mode).
 
 It only READS chain state and SUBMITS already-signed transactions over the same
 key-free RPC surface any wallet uses. It touches no consensus, mining,
@@ -54,6 +66,41 @@ Recycle mode restricts destinations to the unlocked wallets themselves, so value
 circulates among accounts you control and no XUS can leave the set. Fees are
 still spent (they go to miners), so the closed loop drains slowly at the fee
 rate; it is a containment property, not a perpetual-motion machine.
+
+### Adversarial mode
+
+The **Prove the defenses hold** panel fires a fixed battery of deliberately
+hostile transactions at the target node and proves the node rejects every one
+*before admission* — the mempool must not grow. It reuses the cannon's own
+construction and signing path with one deliberate corruption per attack, so it
+adds no dependency on the chain's red-team crate. The classes mirror the chain's
+own live-fire probe:
+
+- **crypto** — a tampered Ed25519 half, a tampered post-quantum (ML-DSA-65) half
+  *with the Ed25519 half left valid* (the hybrid signature is a conjunction, so
+  this must still fail), both halves forged, and a downgrade to an Ed25519-only
+  signature against a hybrid key.
+- **authz** — spending an implicit account with the wrong key, and spending from
+  a keyless named account nobody controls.
+- **replay** — splicing a signature valid for a different nonce, and mutating the
+  nonce after signing: a signed authorization cannot be re-bound to another nonce.
+- **value** — a negative amount and an amount past the `u128` grain ceiling, both
+  refused at the parser (so they leave no residue regardless of admission gates).
+- **encoding / rpc** — a non-numeric nonce, a missing signature, an over-length
+  account id, an unknown RPC method, and a ~1 MB body: the node rejects cleanly
+  and keeps serving.
+
+The load-bearing verdict is **no residue**: the battery records
+`sov_getMempoolSize` before and after and PASSes only if the pool did not grow
+**and** every attack drew an explicit rejection. If the pool grows, that is a
+loud failure, never a silent pass.
+
+> **Mainnet guard.** These are deliberately hostile bytes, and one payload in
+> this family was once a live crash-DoS before it was patched. When the target
+> reports a mainnet chain id the battery will **not** fire until you type the
+> exact confirmation phrase (`FIRE ON MAINNET`); it is off and guarded by
+> default. Every attack is engineered to be rejected for a reason independent of
+> chain state, so none can be admitted regardless of balances or nonces.
 
 ## Build and run
 

@@ -4223,6 +4223,7 @@ dependencies = [
  "eframe",
  "getrandom 0.2.17",
  "hex",
+ "serde_json",
  "sov-crypto",
  "sov-primitives",
  "sov-rpc",
