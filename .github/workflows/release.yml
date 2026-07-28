@@ -1,0 +1,167 @@
+name: Release
+
+# Cut a release ONLY from a version tag (`vX.Y.Z`). The headline artifact is a
+# NATIVE Apple Silicon (arm64) macOS binary — built and TESTED on an arm64 runner,
+# never cross-compiled — because that is what the owner runs. A Linux x86_64 leg
+# rides along but is never allowed to gate the macOS artifact.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing vX.Y.Z tag to (re)build a release for"
+        required: true
+
+permissions:
+  contents: write # create the GitHub Release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Guard: a mis-versioned or branch-based release must be impossible ───────
+  # The tag being released MUST equal Cargo.toml's version exactly, and the ref
+  # MUST be a tag. This mirrors the SOV release contract: `vX.Y.Z` == version.
+  guard:
+    name: version + ref guard
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # workflow_dispatch passes a tag input; a tag push already checks it out.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Tag ref only, and tag == Cargo.toml version
+        id: check
+        run: |
+          set -euo pipefail
+          # Resolve the tag we are releasing: the pushed tag, or the dispatch input.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            case "${GITHUB_REF}" in
+              refs/tags/*) tag="${GITHUB_REF#refs/tags/}" ;;
+              *)
+                echo "Release runs on a TAG ref only, got ${GITHUB_REF}" >&2
+                exit 1 ;;
+            esac
+          fi
+          case "${tag}" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "Tag ${tag} is not a vX.Y.Z release tag" >&2; exit 1 ;;
+          esac
+          version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          if [ "${tag}" != "v${version}" ]; then
+            echo "Tag ${tag} does not match Cargo.toml version ${version} (expected v${version})" >&2
+            exit 1
+          fi
+          echo "releasing ${tag} (Cargo.toml version ${version})"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+  # ── The headline artifact: native Apple Silicon (arm64) macOS ───────────────
+  macos-arm64:
+    name: build + TEST + package (aarch64-apple-darwin)
+    needs: guard
+    runs-on: macos-15 # Apple Silicon (arm64); NOT an Intel or emulated image
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # Prove this really is arm64 before we build or publish a "native" binary.
+      - name: Prove native Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+
+      - name: Install pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc -vV
+          # Belt and braces: the toolchain host must be aarch64 (native, not Rosetta).
+          rustc -vV | grep -q 'host: aarch64-apple-darwin'
+
+      - name: Install native build dependencies (macOS)
+        run: command -v cmake >/dev/null || brew install cmake
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
+      # Apple-Silicon-specific verification: run the REAL test suite on the arm64
+      # runner before packaging, so the published binary is one that passed its
+      # tests natively on Apple Silicon (standing project directive — not build-only).
+      - name: Test on Apple Silicon (arm64)
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Package the arm64 artifact + checksum
+        id: package
+        run: |
+          set -euo pipefail
+          version="${{ needs.guard.outputs.version }}"
+          name="sov-tx-cannon-v${version}-aarch64-apple-darwin"
+          mkdir -p "dist/${name}"
+          cp target/release/sov-tx-cannon "dist/${name}/"
+          cp README.md LICENSE "dist/${name}/" 2>/dev/null || true
+          ( cd dist && tar -czf "${name}.tar.gz" "${name}" )
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          echo "artifact=dist/${name}.tar.gz" >> "${GITHUB_OUTPUT}"
+          echo "checksum=dist/${name}.tar.gz.sha256" >> "${GITHUB_OUTPUT}"
+          echo "--- checksum ---"; cat "dist/${name}.tar.gz.sha256"
+
+      - name: Publish to the GitHub Release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.package.outputs.artifact }}
+            ${{ steps.package.outputs.checksum }}
+
+  # ── Optional ride-along: Linux x86_64. Never gates the macOS artifact. ──────
+  linux-x86_64:
+    name: build + test + package (x86_64-unknown-linux-gnu)
+    needs: guard
+    runs-on: ubuntu-24.04
+    continue-on-error: true # a Linux hiccup must not block the arm64 release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install native build dependencies (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - name: Test
+        run: cargo test --locked
+      - name: Build release binary
+        run: cargo build --locked --release
+      - name: Package the linux artifact + checksum
+        id: package
+        run: |
+          set -euo pipefail
+          version="${{ needs.guard.outputs.version }}"
+          name="sov-tx-cannon-v${version}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${name}"
+          cp target/release/sov-tx-cannon "dist/${name}/"
+          cp README.md LICENSE "dist/${name}/" 2>/dev/null || true
+          ( cd dist && tar -czf "${name}.tar.gz" "${name}" )
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          echo "artifact=dist/${name}.tar.gz" >> "${GITHUB_OUTPUT}"
+          echo "checksum=dist/${name}.tar.gz.sha256" >> "${GITHUB_OUTPUT}"
+      - name: Publish to the GitHub Release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.package.outputs.artifact }}
+            ${{ steps.package.outputs.checksum }}

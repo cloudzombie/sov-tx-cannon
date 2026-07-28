@@ -182,6 +182,30 @@ cargo build --locked --release
 CI runs the same four steps on Linux (`ubuntu-24.04`) and Apple Silicon
 (`macos-15`).
 
+## Releases
+
+Releases are cut by pushing a version tag; the owner/coordinator does that, not
+CI. The release is **Apple-Silicon-native**: the headline artifact is an arm64
+macOS binary **built and tested on an Apple Silicon runner** (`macos-15`), never
+cross-compiled. A Linux x86_64 build rides along but never gates the macOS one.
+
+The release is **tag-only and version-guarded**. `.github/workflows/release.yml`
+fires only on a `vX.Y.Z` tag (or a `workflow_dispatch` naming one) and refuses to
+run unless the tag equals `Cargo.toml`'s `version` exactly — so a mis-versioned
+tag cannot produce a release. CI checks the same contract on any tagged push.
+
+Each artifact is a `.tar.gz` named `sov-tx-cannon-v<version>-<target>` with a
+companion `.sha256` checksum, both attached to the GitHub Release for the tag.
+The macOS job runs `cargo test --locked` on the arm64 runner before packaging,
+so a published binary is one that passed its tests natively on Apple Silicon.
+
+To cut a release:
+
+1. Bump `version` in `Cargo.toml`, refresh `Cargo.lock` (`cargo update -p sov-tx-cannon`), and merge that through a PR.
+2. Push a matching tag: `git tag v0.2.0 && git push origin v0.2.0`.
+3. The release workflow builds, tests on arm64, packages, and publishes the
+   assets. Do not create tags for unreleased or mismatched versions.
+
 ## Boundary
 
 This repository never modifies SOV. If a TX Cannon change appears to require a
