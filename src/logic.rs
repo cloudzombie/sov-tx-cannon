@@ -13,6 +13,9 @@
 //!   * [`build_signed_transfer`] — reuses the chain's real `SignedTransaction::sign`
 //!     (no reimplemented crypto) to produce a verifiable transfer.
 //!
+//!   * [`DuelLedger`] + [`block_outcomes`] + [`duel_verdict`] — the auction
+//!     duel's measurement and its honest verdict (including "inconclusive").
+//!
 //! It also owns every piece of *presentation* arithmetic the GUI needs — axis
 //! scaling ([`nice_ceiling`], [`scope_x`], [`scope_y`]), pressure bucketing
 //! ([`Pressure`]), readiness ([`first_blocker`]) and number formatting
@@ -146,6 +149,17 @@ pub enum RateMode {
         interval_ms: u64,
         /// Symmetric jitter as a percentage of the interval (0 = metronome).
         jitter_pct: u32,
+    },
+    /// One side of the two-wallet AUCTION DUEL: the heartbeat pacer, but with the
+    /// interval NOT divided across the wallets and jitter forced off, so both
+    /// sides beat at the same instants and their transactions compete for the
+    /// same blockspace. Only the tip differs between the sides.
+    Duel {
+        /// Interval between this side's submissions, in milliseconds. Identical
+        /// for both sides — that is what makes the run a controlled comparison.
+        interval_ms: u64,
+        /// Which side this worker is.
+        side: DuelSide,
     },
 }
 
@@ -578,6 +592,541 @@ pub fn per_block_rate(count: u64, elapsed_secs: f64) -> Option<f64> {
         return None;
     }
     Some(count as f64 * BLOCK_SECS / elapsed_secs)
+}
+
+// ---------------------------------------------------------------------------
+// Auction duel — the two-sided, controlled experiment on the fee auction
+// ---------------------------------------------------------------------------
+//
+// The duel answers ONE question with evidence: on this chain, right now, does
+// bidding more in the blockspace auction get a transaction mined sooner?
+//
+// It is a CONTROLLED experiment, which is why it is its own mode rather than a
+// setting. Everything about the two sides is held identical — the same cadence
+// (both sides beat off the same interval, with jitter forced OFF so the pair is
+// submitted as close to simultaneously as two threads can manage and therefore
+// competes for the SAME blockspace), the same amount policy, the same
+// destination policy, the same safety rails, the same node. The ONLY variable
+// is the tip. That isolation is the entire point: without it, nothing observed
+// could honestly be attributed to the bid.
+//
+// Every figure below is an observation, never an inference:
+//   * a landing is read from the CHAIN — our signer's transaction found in a
+//     mined block (which gives the exact height AND its index in that block's
+//     execution order), or, as a fallback, the node's own account nonce
+//     advancing past a nonce we submitted. Never from mempool acceptance.
+//   * time-to-land is the (blocks, seconds) gap between submitting and that
+//     observation.
+//   * the verdict is computed from those numbers by [`duel_verdict`], and says
+//     so plainly when there are not yet enough of them.
+
+/// The duel is two-sided by construction: exactly this many wallets.
+pub const DUEL_WALLETS: usize = 2;
+
+/// Side A's default bid: ten times the suggested tip. Deliberately well clear of
+/// any floor a gently-loaded chain can produce, so the experiment starts with a
+/// real spread between the sides rather than two indistinguishable bids.
+pub const DUEL_HIGH_BID_GRAINS: u128 = SUGGESTED_TIP_GRAINS * 10;
+
+/// Default duel cadence: one PAIR every 60 s — about 2.5 pairs per 150 s block,
+/// enough contention to observe ordering without becoming a load test.
+pub const DUEL_DEFAULT_INTERVAL_SECS: f64 = 60.0;
+
+/// Landings (both sides together) required before the verdict is anything other
+/// than "inconclusive". Small samples of a two-way race say nothing.
+pub const DUEL_MIN_LANDED: u64 = 4;
+
+/// A difference in mean wait smaller than this many blocks is not a difference:
+/// the landing observation is polled, so sub-block differences are noise.
+pub const DUEL_BLOCK_EPSILON: f64 = 0.5;
+
+/// Per-side landing samples retained. Bounds memory for an indefinite run while
+/// keeping enough history for the per-block strip and the means.
+pub const DUEL_MAX_SAMPLES: usize = 512;
+
+/// Which side of the duel a worker is. Side A is the high bid by convention, so
+/// the panel and the verdict always read the same way round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DuelSide {
+    /// The high bid.
+    A,
+    /// The low (or absent) bid.
+    B,
+}
+
+impl DuelSide {
+    /// The side's full name, as the UI and the verdict say it.
+    pub fn label(self) -> &'static str {
+        match self {
+            DuelSide::A => "Side A (high bid)",
+            DuelSide::B => "Side B (low bid)",
+        }
+    }
+
+    /// The one-letter form, for the per-block strip.
+    pub fn short(self) -> &'static str {
+        match self {
+            DuelSide::A => "A",
+            DuelSide::B => "B",
+        }
+    }
+}
+
+/// Why a duel cannot arm: it is not a two-sided contest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DuelBlock {
+    /// Fewer than two wallets are selected.
+    TooFew(usize),
+    /// More than two wallets are selected.
+    TooMany(usize),
+}
+
+impl DuelBlock {
+    /// The operator-facing reason, in words — this is what a disabled Start says.
+    pub fn message(self) -> String {
+        match self {
+            DuelBlock::TooFew(n) => format!(
+                "The duel needs EXACTLY two wallets — one per side — and {n} is selected. Check a \
+                 second unlocked wallet to fire as side B."
+            ),
+            DuelBlock::TooMany(n) => format!(
+                "The duel needs EXACTLY two wallets — one per side — and {n} are selected. A third \
+                 sender would add traffic that is neither side, so the comparison would no longer \
+                 be controlled."
+            ),
+        }
+    }
+}
+
+/// Whether this selection can arm a duel. `None` means it can — exactly two.
+///
+/// This is the enforcement the mode is built around: with one wallet there is no
+/// contest, and with three the bid is no longer the only variable.
+pub fn duel_wallet_check(selected: usize) -> Option<DuelBlock> {
+    if selected < DUEL_WALLETS {
+        Some(DuelBlock::TooFew(selected))
+    } else if selected > DUEL_WALLETS {
+        Some(DuelBlock::TooMany(selected))
+    } else {
+        None
+    }
+}
+
+/// Resolve both sides' bids through the SAME resolver the heartbeat uses
+/// ([`heartbeat_tip_mode`]), so a duel bid is constructed no differently from any
+/// other bid — only its value differs between the sides.
+///
+/// Each side is `(choice, manual)`: the manual mode is consulted only for
+/// [`TipChoice::Manual`], so a side set to auto or to no-tip is unaffected by
+/// whatever the other side's fields say.
+pub fn duel_bids(a: (TipChoice, TipMode), b: (TipChoice, TipMode)) -> (TipMode, TipMode) {
+    (heartbeat_tip_mode(a.0, a.1), heartbeat_tip_mode(b.0, b.1))
+}
+
+/// A resolved bid in words, for the side panels and the frozen run record.
+pub fn duel_bid_label(m: TipMode) -> String {
+    match m {
+        TipMode::Off => "no tip — bare action".to_string(),
+        TipMode::Fixed(v) => format!("{} XUS", fmt_xus(v)),
+        TipMode::Range { min, max } => format!("{}–{} XUS", fmt_xus(min), fmt_xus(max)),
+    }
+}
+
+/// The honest caveat when the two sides are not actually bidding differently: the
+/// run is then a null/control experiment and cannot show what a higher bid buys.
+pub fn duel_bid_note(a: TipMode, b: TipMode) -> Option<&'static str> {
+    if a == b {
+        Some(
+            "both sides are bidding the SAME — this is a null (control) run: it can show that two \
+             identical sides behave alike, not what a higher bid buys.",
+        )
+    } else {
+        None
+    }
+}
+
+/// One transaction of ours observed in a mined block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Landing {
+    /// The nonce that landed.
+    pub nonce: u64,
+    /// The height it was observed at.
+    pub height: u64,
+    /// Blocks between the tip when it was submitted and the observation.
+    pub blocks: u64,
+    /// Milliseconds between the submit and the observation.
+    pub ms: u64,
+    /// Its index in the block's execution order, when the block body was read.
+    /// `None` when the landing was inferred from the account nonce instead — the
+    /// count is still exact, the ordering is simply not known.
+    pub index: Option<usize>,
+    /// How many transactions that block held, when the body was read.
+    pub txs: Option<usize>,
+}
+
+/// A transaction submitted and not yet observed in a block.
+#[derive(Clone, Copy, Debug)]
+struct InFlight {
+    nonce: u64,
+    at_ms: u64,
+    height: u64,
+}
+
+/// One side's measured record: what it submitted, what landed, and how long each
+/// landing waited. Fed only by real observations; it never guesses.
+#[derive(Clone, Debug, Default)]
+pub struct DuelLedger {
+    /// Submitted, not yet seen mined. Nonces are monotonic, so this stays sorted.
+    inflight: VecDeque<InFlight>,
+    /// Recent landings (bounded to [`DUEL_MAX_SAMPLES`]).
+    landings: VecDeque<Landing>,
+    submitted: u64,
+    landed: u64,
+    /// Sums over EVERY landing (not just the retained window), so the means stay
+    /// honest for a run longer than the sample buffer.
+    sum_blocks: u128,
+    sum_ms: u128,
+}
+
+impl DuelLedger {
+    /// An empty ledger.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `nonce` went out at `at_ms` with the tip at `height`.
+    ///
+    /// Re-submitting a nonce still in flight (a retry after a transport failure)
+    /// updates that record rather than counting a second transaction: the account
+    /// only ever consumes the nonce once.
+    pub fn on_submit(&mut self, nonce: u64, at_ms: u64, height: u64) {
+        if let Some(f) = self.inflight.iter_mut().find(|f| f.nonce == nonce) {
+            f.at_ms = at_ms;
+            f.height = height;
+            return;
+        }
+        self.inflight.push_back(InFlight {
+            nonce,
+            at_ms,
+            height,
+        });
+        self.submitted = self.submitted.saturating_add(1);
+    }
+
+    /// Record our transaction found in a mined block: `nonce` at `index` of a
+    /// block of `txs` transactions at `height`, observed at `now_ms`.
+    ///
+    /// This is the precise path — the height and the intra-block ordering both
+    /// come from the block itself. Returns whether it matched something in flight
+    /// (a block from before the run, or a re-scan, matches nothing).
+    pub fn on_block_hit(
+        &mut self,
+        height: u64,
+        nonce: u64,
+        index: usize,
+        txs: usize,
+        now_ms: u64,
+    ) -> bool {
+        let Some(pos) = self.inflight.iter().position(|f| f.nonce == nonce) else {
+            return false;
+        };
+        let f = self.inflight.remove(pos).expect("position just found");
+        self.push_landing(Landing {
+            nonce,
+            height,
+            blocks: height.saturating_sub(f.height),
+            ms: now_ms.saturating_sub(f.at_ms),
+            index: Some(index),
+            txs: Some(txs),
+        });
+        true
+    }
+
+    /// Sweep up anything the block scan missed: the node reports the account at
+    /// `node_nonce`, so every nonce below it HAS been mined. Returns how many
+    /// landings this added.
+    ///
+    /// Landings found this way carry no index — the count and the wait are real,
+    /// the position in the block is simply unknown.
+    pub fn on_node_nonce(&mut self, node_nonce: u64, now_ms: u64, height: u64) -> u64 {
+        let mut added = 0;
+        while let Some(f) = self.inflight.front().copied() {
+            if f.nonce >= node_nonce {
+                break;
+            }
+            self.inflight.pop_front();
+            self.push_landing(Landing {
+                nonce: f.nonce,
+                height,
+                blocks: height.saturating_sub(f.height),
+                ms: now_ms.saturating_sub(f.at_ms),
+                index: None,
+                txs: None,
+            });
+            added += 1;
+        }
+        added
+    }
+
+    fn push_landing(&mut self, l: Landing) {
+        self.landed = self.landed.saturating_add(1);
+        self.sum_blocks = self.sum_blocks.saturating_add(u128::from(l.blocks));
+        self.sum_ms = self.sum_ms.saturating_add(u128::from(l.ms));
+        self.landings.push_back(l);
+        while self.landings.len() > DUEL_MAX_SAMPLES {
+            self.landings.pop_front();
+        }
+    }
+
+    /// This side's figures as the panel and the verdict consume them.
+    pub fn stats(&self) -> DuelStats {
+        let n = self.landed as f64;
+        DuelStats {
+            submitted: self.submitted,
+            landed: self.landed,
+            pooled: self.inflight.len() as u64,
+            mean_blocks: (self.landed > 0).then(|| self.sum_blocks as f64 / n),
+            mean_secs: (self.landed > 0).then(|| self.sum_ms as f64 / n / 1_000.0),
+        }
+    }
+
+    /// Retained landings, newest last.
+    pub fn landings(&self) -> &VecDeque<Landing> {
+        &self.landings
+    }
+
+    /// `(height, index)` per retained landing — the input to [`block_outcomes`].
+    pub fn positions(&self) -> Vec<(u64, Option<usize>)> {
+        self.landings.iter().map(|l| (l.height, l.index)).collect()
+    }
+}
+
+/// One side's measured outcome. `mean_*` are `None` until that side has landed
+/// something — an unlanded side reports a dash, never a zero wait.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DuelStats {
+    /// Transactions this side submitted.
+    pub submitted: u64,
+    /// Transactions of this side's the chain has mined.
+    pub landed: u64,
+    /// Submitted, still sitting in the pool.
+    pub pooled: u64,
+    /// Mean blocks waited from submit to observed mined.
+    pub mean_blocks: Option<f64>,
+    /// Mean seconds waited from submit to observed mined.
+    pub mean_secs: Option<f64>,
+}
+
+/// What happened in one block that at least one side landed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockOutcome {
+    /// The block height.
+    pub height: u64,
+    /// How many of side A's transactions it included.
+    pub a: u64,
+    /// How many of side B's.
+    pub b: u64,
+    /// Which side came FIRST in the block's execution order, when both sides
+    /// landed in it and both indexes are known. `None` when only one side landed,
+    /// or when the ordering was not observed.
+    pub first: Option<DuelSide>,
+}
+
+/// Fold both sides' `(height, index)` landings into a per-block record.
+///
+/// Only blocks at least one side landed in appear: a block neither side made is
+/// not an outcome of the duel, and inventing a row for it would misrepresent the
+/// sample size.
+pub fn block_outcomes(a: &[(u64, Option<usize>)], b: &[(u64, Option<usize>)]) -> Vec<BlockOutcome> {
+    let mut heights: Vec<u64> = a.iter().chain(b.iter()).map(|(h, _)| *h).collect();
+    heights.sort_unstable();
+    heights.dedup();
+    heights
+        .into_iter()
+        .map(|h| {
+            let at = |side: &[(u64, Option<usize>)]| -> (u64, Option<usize>) {
+                let hits = side.iter().filter(|(hh, _)| *hh == h);
+                let mut count = 0;
+                let mut first: Option<usize> = None;
+                for (_, idx) in hits {
+                    count += 1;
+                    if let Some(i) = idx {
+                        first = Some(first.map_or(*i, |f: usize| f.min(*i)));
+                    }
+                }
+                (count, first)
+            };
+            let (ac, ai) = at(a);
+            let (bc, bi) = at(b);
+            let first = match (ac > 0, bc > 0, ai, bi) {
+                (true, true, Some(i), Some(j)) if i < j => Some(DuelSide::A),
+                (true, true, Some(i), Some(j)) if j < i => Some(DuelSide::B),
+                _ => None,
+            };
+            BlockOutcome {
+                height: h,
+                a: ac,
+                b: bc,
+                first,
+            }
+        })
+        .collect()
+}
+
+/// Who won the blocks: a side "wins" a block it landed in and the other did not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DuelTally {
+    /// Blocks in the sample (blocks at least one side landed in).
+    pub blocks: usize,
+    /// Blocks only side A landed in.
+    pub a_wins: u64,
+    /// Blocks only side B landed in.
+    pub b_wins: u64,
+    /// Blocks BOTH sides landed in.
+    pub shared: u64,
+    /// Of the shared blocks, how many side A was ordered first in.
+    pub a_first: u64,
+    /// Of the shared blocks, how many side B was ordered first in.
+    pub b_first: u64,
+}
+
+/// Count the per-block wins, and — where the block bodies gave us an ordering —
+/// which side the miner scheduled first inside the blocks they shared.
+pub fn tally_blocks(outcomes: &[BlockOutcome]) -> DuelTally {
+    let mut t = DuelTally {
+        blocks: outcomes.len(),
+        ..DuelTally::default()
+    };
+    for o in outcomes {
+        match (o.a > 0, o.b > 0) {
+            (true, false) => t.a_wins += 1,
+            (false, true) => t.b_wins += 1,
+            (true, true) => {
+                t.shared += 1;
+                match o.first {
+                    Some(DuelSide::A) => t.a_first += 1,
+                    Some(DuelSide::B) => t.b_first += 1,
+                    None => {}
+                }
+            }
+            (false, false) => {}
+        }
+    }
+    t
+}
+
+/// What the measurement says so far. The wording is the payload: each variant
+/// carries a sentence built from the real numbers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Not enough landed yet to claim anything.
+    Inconclusive(String),
+    /// The higher bid measurably landed sooner and/or more often.
+    HigherBid(String),
+    /// Both sides measured the same, within the noise floor.
+    NoDifference(String),
+    /// The measurement went the OTHER way — reported as found, not explained away.
+    Contrary(String),
+}
+
+impl Verdict {
+    /// The sentence.
+    pub fn text(&self) -> &str {
+        match self {
+            Verdict::Inconclusive(s)
+            | Verdict::HigherBid(s)
+            | Verdict::NoDifference(s)
+            | Verdict::Contrary(s) => s,
+        }
+    }
+
+    /// A one-word headline for the panel.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Verdict::Inconclusive(_) => "INCONCLUSIVE",
+            Verdict::HigherBid(_) => "HIGHER BID WINS",
+            Verdict::NoDifference(_) => "NO DIFFERENCE",
+            Verdict::Contrary(_) => "CONTRARY",
+        }
+    }
+}
+
+/// The running verdict, computed from the two sides' measured numbers.
+///
+/// The rules are deliberately conservative, because the honest answer on a
+/// lightly-loaded chain is often "no difference":
+///   * fewer than [`DUEL_MIN_LANDED`] landings in total ⇒ INCONCLUSIVE;
+///   * one side landing and the other not ⇒ that side won outright;
+///   * otherwise compare the mean blocks waited, and call it a difference only
+///     when it exceeds [`DUEL_BLOCK_EPSILON`] blocks.
+///
+/// Nothing here asserts a mechanism — only what was measured.
+pub fn duel_verdict(a: &DuelStats, b: &DuelStats, t: &DuelTally) -> Verdict {
+    let total = a.landed.saturating_add(b.landed);
+    let blocks = format!(
+        "blocks won A {} · B {} · shared {}",
+        t.a_wins, t.b_wins, t.shared
+    );
+    if total < DUEL_MIN_LANDED {
+        return Verdict::Inconclusive(format!(
+            "inconclusive so far — {total} of the {DUEL_MIN_LANDED} landings needed before the \
+             numbers mean anything (A landed {}, B landed {}; A has {} pooled, B {})",
+            a.landed, b.landed, a.pooled, b.pooled
+        ));
+    }
+    match (a.mean_blocks, b.mean_blocks) {
+        (Some(am), Some(bm)) => {
+            let d = bm - am; // > 0 ⇒ A waited less
+            let order = if t.shared > 0 && (t.a_first + t.b_first) > 0 {
+                format!(
+                    "; of {} shared blocks the miner ordered A first in {} and B first in {}",
+                    t.shared, t.a_first, t.b_first
+                )
+            } else {
+                String::new()
+            };
+            let core = format!(
+                "over {total} landings A waited {am:.1} blocks ({:.0} s) on average and B waited \
+                 {bm:.1} blocks ({:.0} s) — {blocks}{order}",
+                a.mean_secs.unwrap_or(f64::NAN),
+                b.mean_secs.unwrap_or(f64::NAN),
+            );
+            if d >= DUEL_BLOCK_EPSILON {
+                Verdict::HigherBid(format!(
+                    "the higher bid landed sooner by {d:.1} blocks: {core}"
+                ))
+            } else if d <= -DUEL_BLOCK_EPSILON {
+                Verdict::Contrary(format!(
+                    "the LOWER bid landed sooner by {:.1} blocks — the higher bid did not win this \
+                     sample: {core}",
+                    -d
+                ))
+            } else {
+                Verdict::NoDifference(format!(
+                    "no measurable difference in wait ({:.1} blocks apart, under the {DUEL_BLOCK_EPSILON} \
+                     block noise floor): {core}",
+                    d.abs()
+                ))
+            }
+        }
+        (Some(am), None) => Verdict::HigherBid(format!(
+            "only the higher bid is landing: A landed {} in {am:.1} blocks ({:.0} s) on average \
+             while B landed none and has {} still pooled — {blocks}",
+            a.landed,
+            a.mean_secs.unwrap_or(f64::NAN),
+            b.pooled
+        )),
+        (None, Some(bm)) => Verdict::Contrary(format!(
+            "only the LOWER bid is landing: B landed {} in {bm:.1} blocks ({:.0} s) on average \
+             while A landed none and has {} still pooled — {blocks}",
+            b.landed,
+            b.mean_secs.unwrap_or(f64::NAN),
+            a.pooled
+        )),
+        (None, None) => Verdict::Inconclusive(
+            "inconclusive — nothing has landed on either side yet".to_string(),
+        ),
+    }
 }
 
 /// What kind of rejection the node returned for a submit. Buckets mirror the
@@ -2565,5 +3114,356 @@ mod tests {
         // honestly — the pacer holds submissions, the landed figure tells the truth.
         assert_eq!(per_block_rate(24, 900.0), Some(4.0));
         assert_eq!(per_block_rate(6, 900.0), Some(1.0));
+    }
+
+    // -- the auction duel ---------------------------------------------------
+
+    #[test]
+    fn duel_arms_only_with_exactly_two_wallets() {
+        // One wallet is not a contest; three means the bid is no longer the only
+        // variable. Both refuse, each with its own stated reason.
+        assert_eq!(duel_wallet_check(0), Some(DuelBlock::TooFew(0)));
+        assert_eq!(duel_wallet_check(1), Some(DuelBlock::TooFew(1)));
+        assert_eq!(duel_wallet_check(3), Some(DuelBlock::TooMany(3)));
+        assert_eq!(duel_wallet_check(7), Some(DuelBlock::TooMany(7)));
+        // Exactly two arms.
+        assert_eq!(duel_wallet_check(2), None);
+        // The reasons say the number the operator actually selected.
+        assert!(DuelBlock::TooFew(1).message().contains('1'));
+        assert!(DuelBlock::TooMany(3).message().contains('3'));
+        assert!(DuelBlock::TooFew(1).message().contains("EXACTLY two"));
+    }
+
+    #[test]
+    fn duel_resolves_each_sides_bid_independently() {
+        // The demonstrating default: A bids high, B bids nothing at all.
+        let (a, b) = duel_bids(
+            (TipChoice::Manual, TipMode::Fixed(DUEL_HIGH_BID_GRAINS)),
+            (TipChoice::NoTip, TipMode::Fixed(DUEL_HIGH_BID_GRAINS)),
+        );
+        assert_eq!(a, TipMode::Fixed(DUEL_HIGH_BID_GRAINS));
+        assert_eq!(b, TipMode::Off); // bare action: B's manual field is ignored
+        assert!(duel_bid_note(a, b).is_none()); // a real contest
+        assert_eq!(duel_bid_label(b), "no tip — bare action");
+
+        // Auto resolves to the suggested tip on whichever side chose it, and a
+        // range on one side does not disturb the other.
+        let (a, b) = duel_bids(
+            (TipChoice::Auto, TipMode::Off),
+            (TipChoice::Manual, TipMode::Range { min: 1, max: 1_000 }),
+        );
+        assert_eq!(a, TipMode::Fixed(SUGGESTED_TIP_GRAINS));
+        assert_eq!(b, TipMode::Range { min: 1, max: 1_000 });
+
+        // Two identical bids is a null run, and says so rather than pretending to
+        // measure the bid.
+        let (a, b) = duel_bids(
+            (TipChoice::Auto, TipMode::Off),
+            (TipChoice::Auto, TipMode::Off),
+        );
+        assert_eq!(a, b);
+        assert!(duel_bid_note(a, b).is_some());
+    }
+
+    #[test]
+    fn duel_ledger_measures_landings_latency_and_pooling() {
+        // A side RUNNING: three transactions submitted one block apart, two of
+        // them found in mined blocks (so their index in the block is known) and
+        // one only visible through the account nonce.
+        let mut l = DuelLedger::new();
+        l.on_submit(10, 0, 100);
+        l.on_submit(11, 60_000, 100);
+        l.on_submit(12, 120_000, 101);
+        assert_eq!(l.stats().submitted, 3);
+        assert_eq!(l.stats().pooled, 3);
+        assert_eq!(l.stats().landed, 0);
+        assert_eq!(l.stats().mean_blocks, None); // nothing landed ⇒ no wait to report
+
+        // Block 101 held nonce 10 first of three transactions.
+        assert!(l.on_block_hit(101, 10, 0, 3, 90_000));
+        // Block 102 held nonce 11 second of four.
+        assert!(l.on_block_hit(102, 11, 1, 4, 240_000));
+        // A block we did not scan mined nonce 12: the node now reports nonce 13.
+        assert_eq!(l.on_node_nonce(13, 400_000, 103), 1);
+        // Nothing left to land, and a repeat sweep adds nothing.
+        assert_eq!(l.on_node_nonce(13, 500_000, 104), 0);
+
+        let s = l.stats();
+        assert_eq!((s.submitted, s.landed, s.pooled), (3, 3, 0));
+        // Waits: 101-100 = 1, 102-100 = 2, 103-101 = 2 blocks ⇒ mean 5/3.
+        assert!((s.mean_blocks.unwrap() - 5.0 / 3.0).abs() < 1e-9);
+        // Seconds: 90, 180, 280 ⇒ mean 550/3.
+        assert!((s.mean_secs.unwrap() - 550.0 / 3.0).abs() < 1e-9);
+        // The ordering is recorded where the block body gave it, and honestly
+        // absent where it did not.
+        let ls: Vec<Landing> = l.landings().iter().copied().collect();
+        assert_eq!(ls[0].index, Some(0));
+        assert_eq!(ls[0].txs, Some(3));
+        assert_eq!(ls[1].index, Some(1));
+        assert_eq!(ls[2].index, None);
+        assert_eq!(
+            l.positions(),
+            vec![(101, Some(0)), (102, Some(1)), (103, None)]
+        );
+
+        // A retry of a nonce still in flight is the SAME transaction, not a second.
+        let mut r = DuelLedger::new();
+        r.on_submit(5, 0, 10);
+        r.on_submit(5, 1_000, 11);
+        assert_eq!(r.stats().submitted, 1);
+        assert_eq!(r.stats().pooled, 1);
+        // …and it is timed from the submit that actually stuck.
+        assert!(r.on_block_hit(12, 5, 0, 1, 3_000));
+        assert_eq!(r.landings()[0].blocks, 1);
+        assert_eq!(r.landings()[0].ms, 2_000);
+        // A block hit for something never submitted matches nothing.
+        assert!(!r.on_block_hit(13, 99, 0, 1, 4_000));
+    }
+
+    #[test]
+    fn duel_block_outcomes_count_wins_and_intra_block_ordering() {
+        // Block 10: A only. 11: both, A ordered first. 12: B only. 13: both,
+        // B first. 14: both, ordering unobserved.
+        let a = [
+            (10u64, Some(0usize)),
+            (11, Some(1)),
+            (13, Some(4)),
+            (14, None),
+        ];
+        let b = [
+            (11u64, Some(3usize)),
+            (12, Some(0)),
+            (13, Some(2)),
+            (14, None),
+        ];
+        let o = block_outcomes(&a, &b);
+        assert_eq!(o.len(), 5);
+        assert_eq!(
+            o[0],
+            BlockOutcome {
+                height: 10,
+                a: 1,
+                b: 0,
+                first: None
+            }
+        );
+        assert_eq!(
+            o[1],
+            BlockOutcome {
+                height: 11,
+                a: 1,
+                b: 1,
+                first: Some(DuelSide::A)
+            }
+        );
+        assert_eq!(
+            o[2],
+            BlockOutcome {
+                height: 12,
+                a: 0,
+                b: 1,
+                first: None
+            }
+        );
+        assert_eq!(o[3].first, Some(DuelSide::B));
+        assert_eq!(o[4].first, None); // both landed, ordering not observed
+
+        let t = tally_blocks(&o);
+        assert_eq!(t.blocks, 5);
+        assert_eq!((t.a_wins, t.b_wins, t.shared), (1, 1, 3));
+        assert_eq!((t.a_first, t.b_first), (1, 1));
+
+        // Two of a side's transactions in one block count as two, one block.
+        let o = block_outcomes(&[(20, Some(0)), (20, Some(1))], &[]);
+        assert_eq!(
+            o,
+            vec![BlockOutcome {
+                height: 20,
+                a: 2,
+                b: 0,
+                first: None
+            }]
+        );
+        assert_eq!(tally_blocks(&o).a_wins, 1);
+        // No landings at all is an empty sample, not a zero-zero block.
+        assert!(block_outcomes(&[], &[]).is_empty());
+        assert_eq!(tally_blocks(&[]), DuelTally::default());
+    }
+
+    #[test]
+    fn duel_verdict_is_inconclusive_on_a_thin_sample() {
+        // One landing each is not evidence of anything.
+        let a = DuelStats {
+            submitted: 2,
+            landed: 1,
+            pooled: 1,
+            mean_blocks: Some(1.0),
+            mean_secs: Some(150.0),
+        };
+        let b = DuelStats {
+            submitted: 2,
+            landed: 1,
+            pooled: 1,
+            mean_blocks: Some(4.0),
+            mean_secs: Some(600.0),
+        };
+        let v = duel_verdict(&a, &b, &DuelTally::default());
+        assert!(matches!(v, Verdict::Inconclusive(_)), "{v:?}");
+        assert!(v.text().contains("inconclusive"));
+        // It says how far off a verdict it is, and what each side has done.
+        assert!(v.text().contains(&DUEL_MIN_LANDED.to_string()));
+        // Nothing landed at all is also inconclusive, not "no difference".
+        let none = DuelStats {
+            submitted: 3,
+            landed: 0,
+            pooled: 3,
+            ..DuelStats::default()
+        };
+        assert!(matches!(
+            duel_verdict(&none, &none, &DuelTally::default()),
+            Verdict::Inconclusive(_)
+        ));
+    }
+
+    #[test]
+    fn duel_verdict_states_only_what_was_measured() {
+        let tally = DuelTally {
+            blocks: 6,
+            a_wins: 3,
+            b_wins: 1,
+            shared: 2,
+            a_first: 2,
+            b_first: 0,
+        };
+        let fast = DuelStats {
+            submitted: 6,
+            landed: 5,
+            pooled: 1,
+            mean_blocks: Some(1.2),
+            mean_secs: Some(180.0),
+        };
+        let slow = DuelStats {
+            submitted: 6,
+            landed: 4,
+            pooled: 2,
+            mean_blocks: Some(3.4),
+            mean_secs: Some(510.0),
+        };
+
+        // The higher bid waited 2.2 blocks less over 9 landings.
+        let v = duel_verdict(&fast, &slow, &tally);
+        assert!(matches!(v, Verdict::HigherBid(_)), "{v:?}");
+        assert_eq!(v.word(), "HIGHER BID WINS");
+        assert!(v.text().contains("2.2 blocks"));
+        assert!(v.text().contains("blocks won A 3 · B 1 · shared 2"));
+        assert!(v.text().contains("ordered A first in 2"));
+
+        // Reversed, it is reported as CONTRARY rather than smoothed over.
+        let v = duel_verdict(&slow, &fast, &tally);
+        assert!(matches!(v, Verdict::Contrary(_)), "{v:?}");
+        assert!(v.text().contains("LOWER bid landed sooner"));
+
+        // Inside the noise floor it is honestly no difference — the common case
+        // on a chain that is nowhere near capacity.
+        let near = DuelStats {
+            mean_blocks: Some(1.4),
+            ..fast
+        };
+        let v = duel_verdict(&fast, &near, &tally);
+        assert!(matches!(v, Verdict::NoDifference(_)), "{v:?}");
+        assert!(v.text().contains("no measurable difference"));
+
+        // One side landing and the other not at all: won outright, and the panel
+        // still reports B's pooled backlog rather than implying it vanished.
+        let stuck = DuelStats {
+            submitted: 6,
+            landed: 0,
+            pooled: 6,
+            mean_blocks: None,
+            mean_secs: None,
+        };
+        let v = duel_verdict(&fast, &stuck, &tally);
+        assert!(matches!(v, Verdict::HigherBid(_)), "{v:?}");
+        assert!(v.text().contains("only the higher bid is landing"));
+        assert!(v.text().contains('6'));
+        let v = duel_verdict(&stuck, &fast, &tally);
+        assert!(matches!(v, Verdict::Contrary(_)), "{v:?}");
+    }
+
+    #[test]
+    fn a_running_duel_measures_the_race_and_reaches_a_verdict() {
+        // The whole pure pipeline in its RUNNING state: the shared pacer issues a
+        // PAIR of submissions per beat, blocks arrive, both sides' landings are
+        // observed off the block bodies, and the verdict is computed from them.
+        //
+        // The scripted chain: a 150 s block time, one pair every 60 s. Side A (the
+        // high bid) is included in the very next block; side B (no bid) waits two
+        // further blocks and is then included after A in the shared blocks.
+        let mut a = DuelLedger::new();
+        let mut b = DuelLedger::new();
+        let mut beat = Heartbeat::new(60_000, 0); // jitter OFF — both sides in phase
+        let mut rng = Rng::seeded(7);
+        let mut nonce = 0u64;
+        let mut submitted: Vec<(u64, u64, u64)> = Vec::new(); // (nonce, ms, height)
+
+        // Ten minutes of duel: the pacer decides WHEN, and both sides submit the
+        // same nonce sequence at the same instant — the controlled part.
+        for now in (0..600_000u64).step_by(1_000) {
+            if beat.due(now) {
+                let height = 100 + now / 150_000; // a block every 150 s
+                a.on_submit(nonce, now, height);
+                b.on_submit(nonce, now, height);
+                submitted.push((nonce, now, height));
+                nonce += 1;
+                beat.on_submitted(now, &mut rng);
+            }
+        }
+        assert_eq!(submitted.len(), 10); // one pair a minute for ten minutes
+        assert_eq!(a.stats().submitted, b.stats().submitted); // held equal
+
+        // Now the chain includes them. A lands in the next block after its submit;
+        // B lands two blocks later than A, and after A when they share a block.
+        for (n, ms, h) in &submitted {
+            let a_h = h + 1;
+            a.on_block_hit(a_h, *n, 0, 4, ms + 150_000);
+            let b_h = h + 3;
+            b.on_block_hit(b_h, *n, 2, 4, ms + 450_000);
+        }
+
+        let (sa, sb) = (a.stats(), b.stats());
+        assert_eq!((sa.landed, sa.pooled), (10, 0));
+        assert_eq!((sb.landed, sb.pooled), (10, 0));
+        assert_eq!(sa.mean_blocks, Some(1.0));
+        assert_eq!(sb.mean_blocks, Some(3.0));
+        assert_eq!(sa.mean_secs, Some(150.0));
+        assert_eq!(sb.mean_secs, Some(450.0));
+
+        let outcomes = block_outcomes(&a.positions(), &b.positions());
+        let tally = tally_blocks(&outcomes);
+        // Every block in the sample was landed in by someone, and where both
+        // sides share one, A was ordered first — which is the ordering claim the
+        // block bodies actually support.
+        assert_eq!(tally.blocks, outcomes.len());
+        assert_eq!(tally.b_first, 0);
+        assert!(tally.a_wins > 0, "{tally:?}");
+        assert_eq!(tally.a_first, tally.shared);
+
+        // The verdict: the higher bid landed two blocks sooner, stated from the
+        // measured numbers.
+        let v = duel_verdict(&sa, &sb, &tally);
+        assert!(matches!(v, Verdict::HigherBid(_)), "{v:?}");
+        assert!(v.text().contains("2.0 blocks"));
+        assert!(v.text().contains("over 20 landings"));
+
+        // And the same pipeline early in the run, after ONE pair, honestly refuses
+        // to conclude anything.
+        let (mut ea, mut eb) = (DuelLedger::new(), DuelLedger::new());
+        ea.on_submit(0, 0, 100);
+        eb.on_submit(0, 0, 100);
+        ea.on_block_hit(101, 0, 0, 2, 150_000);
+        let early_outcomes = block_outcomes(&ea.positions(), &eb.positions());
+        let v = duel_verdict(&ea.stats(), &eb.stats(), &tally_blocks(&early_outcomes));
+        assert!(matches!(v, Verdict::Inconclusive(_)), "{v:?}");
+        assert!(v.text().contains("inconclusive so far"));
     }
 }

@@ -15,6 +15,11 @@
 //!   * **Firehose** — submit as fast as sign+POST allows; the mempool's capacity
 //!     rejections are the only brake (the cannon holds and retries the same
 //!     nonce on those, self-pacing to the drain rate).
+//!   * **Heartbeat** — a gentle, indefinite trickle that keeps blocks non-empty,
+//!     self-paced against an ideal schedule, with safety rails.
+//!   * **Auction duel** — a controlled A-vs-B experiment on the blockspace fee
+//!     auction: EXACTLY two wallets, everything held equal except the bid, with
+//!     landings, time-to-land and per-block wins measured off the chain.
 //!
 //! Multiple wallets can fire in parallel (one worker per wallet, each with its
 //! own nonce sequencer and its own zeroizing seed copy), and a live meter panel
@@ -44,12 +49,15 @@ use sov_primitives::AccountId;
 use sov_rpc::{Keystore, RpcClient};
 
 use logic::{
-    build_signed_transfer, classify_reject, derive_account_id, disposition, first_blocker,
+    block_outcomes, build_signed_transfer, classify_reject, derive_account_id, disposition,
+    duel_bid_label, duel_bid_note, duel_bids, duel_verdict, duel_wallet_check, first_blocker,
     fmt_count, fmt_elapsed, fmt_pct, fmt_rate, fmt_secs, fmt_xus, heartbeat_halt,
     heartbeat_tip_mode, nice_ceiling, parse_fee_auction_active, parse_xus, per_block_rate, scope_x,
-    scope_x_age, scope_y, share, AmountMode, Cadence, DestMode, DestSelector, Disposition,
-    Heartbeat, HeartbeatLimits, KeyScheme, MeterKind, NonceSequencer, Pacer, Pressure, RateMeter,
-    RateMode, RejectClass, Rng, TipChoice, TipMode, BLOCK_SECS, HEARTBEAT_JITTER_PCT, SCOPE_GAP_MS,
+    scope_x_age, scope_y, share, tally_blocks, AmountMode, BlockOutcome, Cadence, DestMode,
+    DestSelector, Disposition, DuelLedger, DuelSide, DuelStats, DuelTally, Heartbeat,
+    HeartbeatLimits, KeyScheme, Landing, MeterKind, NonceSequencer, Pacer, Pressure, RateMeter,
+    RateMode, RejectClass, Rng, TipChoice, TipMode, Verdict, BLOCK_SECS,
+    DUEL_DEFAULT_INTERVAL_SECS, DUEL_HIGH_BID_GRAINS, HEARTBEAT_JITTER_PCT, SCOPE_GAP_MS,
     SCOPE_WINDOW_SECS, SUGGESTED_TIP_GRAINS,
 };
 use redteam::ProbeReport;
@@ -95,6 +103,16 @@ const HEARTBEAT_RETRY_BACKOFF: Duration = Duration::from_secs(3);
 /// floor). Long enough not to poll the node hard while parked, short enough to
 /// resume within a block of the balance recovering.
 const HEARTBEAT_PAUSE_BACKOFF: Duration = Duration::from_secs(15);
+/// How often a DUEL worker reconciles with the node. Tighter than the
+/// heartbeat's own interval because the duel MEASURES time-to-land: the sooner a
+/// landing is observed, the tighter the (blocks, seconds) figure. Still an order
+/// of magnitude under the block time, so it is not node load.
+const DUEL_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+/// The most blocks one duel worker will read the body of in a single catch-up
+/// pass. Block bodies are what give the exact height and the intra-block
+/// ordering; if the tool ever falls further behind than this it skips ahead, and
+/// the account-nonce sweep still counts those landings (without an ordering).
+const DUEL_SCAN_MAX_BLOCKS: u64 = 8;
 /// The node's default mempool capacity (display hint for the saturation flag;
 /// the node remains the authority — its "mempool is full" rejections are what
 /// actually gate submission).
@@ -220,6 +238,9 @@ mod palette {
     pub const AMBER: Color32 = Color32::from_rgb(242, 183, 64);
     /// Failure, live-fire arming, saturation.
     pub const RED: Color32 = Color32::from_rgb(232, 97, 92);
+    /// The auction duel's own hue, so the A-vs-B experiment is never confused
+    /// with a plain firing run or with a heartbeat.
+    pub const MAGENTA: Color32 = Color32::from_rgb(226, 122, 197);
 }
 
 /// Set the type scale and chrome once at startup.
@@ -351,6 +372,23 @@ struct WalletStat {
     /// Set when this wallet finished for a NORMAL configured reason (a heartbeat
     /// session cap) — distinct from `fault`, which means something went wrong.
     done_reason: Option<String>,
+    /// This wallet's DUEL side measurements, when the run is a duel. Published by
+    /// the worker from its own ledger; every figure in it is an observation.
+    duel: Option<DuelSideStat>,
+}
+
+/// One duel side's published measurements: the aggregate figures plus the
+/// `(height, index)` of each retained landing, which is what the per-block strip
+/// and the intra-block ordering are computed from.
+#[derive(Clone, Default)]
+struct DuelSideStat {
+    /// Which side published this row. The panel matches on it rather than
+    /// assuming the worker order, so the columns can never be swapped.
+    side_is_a: bool,
+    stats: DuelStats,
+    positions: Vec<(u64, Option<usize>)>,
+    /// The most recent landing, for the "last landed" line.
+    last: Option<Landing>,
 }
 
 impl WalletStat {
@@ -396,6 +434,23 @@ struct Status {
     /// armed with. Frozen at start, so the live readout compares against what is
     /// actually running rather than against whatever the form now says.
     heartbeat: Option<HeartbeatView>,
+    /// Set for the whole life of a DUEL run: the two bids and the cadence it was
+    /// armed with, frozen at Start.
+    duel: Option<DuelView>,
+}
+
+/// The duel a run was started with (frozen at Start). Only the two bids differ;
+/// everything else the two sides use is one shared value by construction.
+#[derive(Clone, Copy)]
+struct DuelView {
+    /// The pair interval, in milliseconds — the SAME for both sides.
+    interval_ms: u64,
+    /// Side A's bid (the high side by convention) and how it was chosen.
+    a: (TipChoice, TipMode),
+    /// Side B's bid.
+    b: (TipChoice, TipMode),
+    /// The rails both sides are independently protected by.
+    limits: HeartbeatLimits,
 }
 
 /// The heartbeat parameters a run was started with (frozen at Start).
@@ -426,6 +481,7 @@ impl Default for Status {
             last_error: String::new(),
             log: Vec::new(),
             heartbeat: None,
+            duel: None,
         }
     }
 }
@@ -521,6 +577,10 @@ struct WorkerConfig {
     /// the selected wallets so the AGGREGATE cap is what the operator typed. Only
     /// consulted by [`run_heartbeat`]; the other modes ignore it.
     limits: HeartbeatLimits,
+    /// Which side of the auction duel this worker is, when the run is a duel.
+    /// `Some` turns on the per-transaction landing measurement (block-body scan +
+    /// account-nonce sweep); `None` leaves every other mode exactly as it was.
+    duel: Option<DuelSide>,
     dry_run: bool,
 }
 
@@ -550,6 +610,60 @@ enum ModeChoice {
     Firehose,
     /// The constant, indefinite trickle — chain liveness, not load.
     Heartbeat,
+    /// The two-wallet AUCTION DUEL: a controlled A-vs-B experiment on the
+    /// blockspace fee auction where the bid is the only variable.
+    Duel,
+}
+
+/// One duel side's bid, as the form holds it. Both sides carry the same fields so
+/// neither side can be configured in a way the other cannot.
+struct SideBid {
+    /// Auto (suggested), manual (the fields below), or no tip at all.
+    choice: TipChoice,
+    /// Draw the manual bid from a range rather than using the fixed value.
+    random: bool,
+    fixed: String,
+    min: String,
+    max: String,
+}
+
+impl SideBid {
+    /// A side that bids one fixed value.
+    fn fixed(grains: u128, choice: TipChoice) -> Self {
+        Self {
+            choice,
+            random: false,
+            fixed: logic::grains_to_xus(grains),
+            min: logic::grains_to_xus(grains),
+            max: logic::grains_to_xus(grains.saturating_mul(2)),
+        }
+    }
+
+    /// The manual bid the fields describe, whatever the three-way choice says.
+    fn manual(&self) -> Result<TipMode, String> {
+        let mode = if self.random {
+            TipMode::Range {
+                min: parse_xus(&self.min).ok_or("bid min is not a valid XUS value")?,
+                max: parse_xus(&self.max).ok_or("bid max is not a valid XUS value")?,
+            }
+        } else {
+            TipMode::Fixed(parse_xus(&self.fixed).ok_or("bid is not a valid XUS value")?)
+        };
+        mode.validate()?;
+        Ok(mode)
+    }
+
+    /// The bid this side will actually place, resolved through the shared
+    /// [`heartbeat_tip_mode`] resolver. A side that is not on MANUAL cannot be
+    /// blocked by an unparseable manual field.
+    fn resolve(&self) -> Result<(TipChoice, TipMode), String> {
+        let manual = if self.choice == TipChoice::Manual {
+            self.manual()?
+        } else {
+            TipMode::Off
+        };
+        Ok((self.choice, manual))
+    }
 }
 
 /// The application state.
@@ -598,6 +712,14 @@ struct CannonApp {
     hb_cap_tx: String,
     hb_cap_spend_on: bool,
     hb_cap_spend: String,
+    // ---- Auction duel (exactly two wallets, bid is the only variable) ----
+    /// The pair cadence: BOTH sides submit one transaction every this many
+    /// seconds, off the same interval, so the two compete for the same block.
+    duel_every_secs: String,
+    /// Side A — the high bid by convention.
+    duel_a: SideBid,
+    /// Side B — the low (or absent) bid.
+    duel_b: SideBid,
     dry_run: bool,
     config_msg: String,
 
@@ -706,6 +828,13 @@ impl Default for CannonApp {
             hb_cap_tx: "1000".to_string(),
             hb_cap_spend_on: false,
             hb_cap_spend: "1".to_string(),
+            // The default duel is the one that DEMONSTRATES the auction: one pair
+            // every 60 s (~2.5 pairs per block, so the two sides genuinely
+            // contend), side A bidding ten times the suggested tip and side B
+            // bidding nothing at all.
+            duel_every_secs: format!("{DUEL_DEFAULT_INTERVAL_SECS:.0}"),
+            duel_a: SideBid::fixed(DUEL_HIGH_BID_GRAINS, TipChoice::Manual),
+            duel_b: SideBid::fixed(0, TipChoice::NoTip),
             dry_run: true,
             config_msg: String::new(),
             status: Arc::new(Mutex::new(Status::default())),
@@ -1003,17 +1132,46 @@ impl CannonApp {
                     },
                 })
             }
+            // The duel's cadence is NOT divided across the wallets: each side
+            // submits at the operator's interval, off the same clock, so the two
+            // sides contend for the same blockspace. `side` is filled in per
+            // worker by `build_worker_configs`.
+            ModeChoice::Duel => Ok(RateMode::Duel {
+                interval_ms: self.parse_duel_cadence()?.interval_ms()?,
+                side: DuelSide::A,
+            }),
         }
+    }
+
+    /// The duel's pair cadence, in the same validated [`Cadence`] terms the
+    /// heartbeat uses (so the same too-fast/too-slow bounds apply).
+    fn parse_duel_cadence(&self) -> Result<Cadence, String> {
+        let s = self
+            .duel_every_secs
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| "the duel interval is not a number of seconds".to_string())?;
+        Ok(Cadence::EverySecs(s))
+    }
+
+    /// Both sides' resolved bids, or the first side that will not parse.
+    fn parse_duel_bids(&self) -> Result<(TipMode, TipMode), String> {
+        let a = self.duel_a.resolve().map_err(|e| format!("side A: {e}"))?;
+        let b = self.duel_b.resolve().map_err(|e| format!("side B: {e}"))?;
+        Ok(duel_bids(a, b))
     }
 
     /// The tip bid for the current mode: the heartbeat's three-way choice (auto /
     /// manual / none) resolves through [`heartbeat_tip_mode`]; every other mode
     /// uses section 3's tip switch exactly as before.
     fn effective_tip_mode(&self) -> Result<TipMode, String> {
-        if self.mode == ModeChoice::Heartbeat {
-            Ok(heartbeat_tip_mode(self.hb_tip, self.parse_tip_fields()?))
-        } else {
-            self.parse_tip_mode()
+        match self.mode {
+            ModeChoice::Heartbeat => Ok(heartbeat_tip_mode(self.hb_tip, self.parse_tip_fields()?)),
+            // The duel has no single bid — that is the point. Side A's is
+            // reported here so the shared per-transaction cost estimate reflects
+            // the more expensive side (the worst case).
+            ModeChoice::Duel => self.parse_duel_bids().map(|(a, _)| a),
+            _ => self.parse_tip_mode(),
         }
     }
 
@@ -1034,6 +1192,14 @@ impl CannonApp {
         if selected.is_empty() {
             self.config_msg = "select at least one wallet to fire from".into();
             return None;
+        }
+        // The duel is a two-sided controlled experiment: refuse to arm with any
+        // other number of wallets, saying which and why.
+        if self.mode == ModeChoice::Duel {
+            if let Some(b) = duel_wallet_check(selected.len()) {
+                self.config_msg = b.message();
+                return None;
+            }
         }
         let dests = match self.parse_dests() {
             Ok(d) => d,
@@ -1063,9 +1229,22 @@ impl CannonApp {
                 return None;
             }
         };
-        // Safety rails. Only the heartbeat consults them, but parse them whenever
-        // it is the selected mode so a bad reserve is refused at Start, not later.
-        let aggregate_limits = if self.mode == ModeChoice::Heartbeat {
+        // Per-side bids: the ONE thing that differs between the duel's workers.
+        let duel_bids = if self.mode == ModeChoice::Duel {
+            match self.parse_duel_bids() {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    self.config_msg = e;
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        // Safety rails. The heartbeat and the duel both consult them (the duel
+        // runs on the heartbeat's loop), so parse them whenever either is the
+        // selected mode: a bad reserve is refused at Start, not later.
+        let aggregate_limits = if matches!(self.mode, ModeChoice::Heartbeat | ModeChoice::Duel) {
             match self.parse_limits() {
                 Ok(l) => l,
                 Err(e) => {
@@ -1097,6 +1276,27 @@ impl CannonApp {
             .enumerate()
             .map(|(worker_i, wallet_i)| {
                 let w = &self.wallets[wallet_i];
+                // In a duel, worker 0 is side A and worker 1 is side B. EVERYTHING
+                // else in this config is identical between them — that is what
+                // makes the run a controlled comparison.
+                let side = match (duel_bids, worker_i) {
+                    (Some(_), 0) => Some(DuelSide::A),
+                    (Some(_), _) => Some(DuelSide::B),
+                    (None, _) => None,
+                };
+                let (tip_mode, mode) = match (duel_bids, side) {
+                    (Some((a, b)), Some(s)) => (
+                        if s == DuelSide::A { a } else { b },
+                        match mode {
+                            RateMode::Duel { interval_ms, .. } => RateMode::Duel {
+                                interval_ms,
+                                side: s,
+                            },
+                            other => other,
+                        },
+                    ),
+                    _ => (tip_mode, mode),
+                };
                 WorkerConfig {
                     rpc_addr: self.rpc_addr.clone(),
                     wallet_index: worker_i,
@@ -1112,6 +1312,7 @@ impl CannonApp {
                     tip_mode,
                     mode,
                     limits,
+                    duel: side,
                     dry_run: self.dry_run,
                 }
             })
@@ -1146,6 +1347,22 @@ impl CannonApp {
             }),
             _ => None,
         };
+        // Freeze the duel this run is armed with: the two bids and the one shared
+        // cadence. The live panel compares against these, not against the form.
+        let duel = match (configs.first().map(|c| (c.mode, c.limits)), self.mode) {
+            (Some((RateMode::Duel { interval_ms, .. }, limits)), ModeChoice::Duel) => self
+                .duel_a
+                .resolve()
+                .ok()
+                .zip(self.duel_b.resolve().ok())
+                .map(|(a, b)| DuelView {
+                    interval_ms,
+                    a: (a.0, heartbeat_tip_mode(a.0, a.1)),
+                    b: (b.0, heartbeat_tip_mode(b.0, b.1)),
+                    limits,
+                }),
+            _ => None,
+        };
         // Reset counters + per-wallet stats for the new run.
         {
             let mut st = self.status.lock().unwrap();
@@ -1160,6 +1377,7 @@ impl CannonApp {
                     })
                     .collect(),
                 heartbeat,
+                duel,
                 ..Status::default()
             };
         }
@@ -1244,12 +1462,19 @@ impl CannonApp {
     /// fire, in the order the operator would fix them. `None` means every field is
     /// usable — so Start being disabled always has a reason on screen.
     fn arming_error(&self) -> Option<String> {
+        // The duel's shape comes first: with the wrong number of wallets there is
+        // no experiment to configure, so that is the reason to report.
+        if self.mode == ModeChoice::Duel {
+            if let Some(b) = duel_wallet_check(self.selected_count()) {
+                return Some(b.message());
+            }
+        }
         self.parse_amount_mode()
             .err()
             .or_else(|| self.effective_tip_mode().err())
             .or_else(|| self.parse_rate_mode(self.selected_count().max(1)).err())
             .or_else(|| {
-                if self.mode == ModeChoice::Heartbeat {
+                if matches!(self.mode, ModeChoice::Heartbeat | ModeChoice::Duel) {
                     self.parse_limits().err()
                 } else {
                     None
@@ -1268,6 +1493,15 @@ impl CannonApp {
                 Ok(d) => format!("heartbeat — {d}"),
                 Err(e) => format!("heartbeat — {e}"),
             },
+            ModeChoice::Duel => match (self.parse_duel_cadence(), self.parse_duel_bids()) {
+                (Ok(c), Ok((a, b))) => format!(
+                    "auction duel — one pair {} · A {} vs B {}",
+                    c.describe(),
+                    duel_bid_label(a),
+                    duel_bid_label(b)
+                ),
+                (Err(e), _) | (_, Err(e)) => format!("auction duel — {e}"),
+            },
         }
     }
 
@@ -1282,6 +1516,12 @@ impl CannonApp {
     fn heartbeat_summary(&self) -> Option<HeartbeatSummary> {
         let st = self.status.lock().ok()?;
         heartbeat_summary_of(&st)
+    }
+
+    /// The live duel readout, or `None` when the current run is not a duel.
+    fn duel_summary(&self) -> Option<DuelSummary> {
+        let st = self.status.lock().ok()?;
+        duel_summary_of(&st)
     }
 
     /// How many wallets are checked to fire.
@@ -1337,6 +1577,106 @@ fn heartbeat_summary_of(st: &Status) -> Option<HeartbeatSummary> {
                 .or_else(|| st.wallets.iter().find_map(|w| w.done_reason.clone())),
         })
     }
+}
+
+/// A frame-local snapshot of the running duel: both sides' measurements, the
+/// per-block record, and the verdict those numbers support.
+struct DuelSummary {
+    /// The one shared pair interval (identical for both sides).
+    interval_ms: u64,
+    elapsed_secs: u64,
+    a: DuelSideView,
+    b: DuelSideView,
+    /// Blocks at least one side landed in, oldest first.
+    outcomes: Vec<BlockOutcome>,
+    tally: DuelTally,
+    verdict: Verdict,
+    /// The rails BOTH sides are independently held to, frozen at Start.
+    limits: HeartbeatLimits,
+    /// The honest caveat when the two bids are not actually different.
+    note: Option<&'static str>,
+}
+
+/// One side of the duel as the panel draws it.
+struct DuelSideView {
+    side: DuelSide,
+    /// The wallet firing this side.
+    wallet: String,
+    choice: TipChoice,
+    bid: TipMode,
+    stats: DuelStats,
+    spent_grains: u128,
+    /// Blocks this side landed in and the other did not.
+    wins: u64,
+    /// This side's most recent landing, exactly as observed.
+    last: Option<Landing>,
+    /// Why this side is not sending right now, if it is not (its own rails).
+    waiting: Option<String>,
+}
+
+/// Aggregate the duel readout from an ALREADY-LOCKED status.
+///
+/// Both sides are read from the same snapshot, so the comparison is always
+/// between two figures observed at the same instant. `None` when the current run
+/// is not a duel, or before both workers have published a side.
+fn duel_summary_of(st: &Status) -> Option<DuelSummary> {
+    let dv = st.duel?;
+    // Match the columns to the side each worker SAID it is, falling back to the
+    // worker order before either has published — the panel can never swap them.
+    let a_stat = st
+        .wallets
+        .iter()
+        .find(|w| w.duel.as_ref().is_some_and(|d| d.side_is_a))
+        .or_else(|| st.wallets.first())?;
+    let b_stat = st
+        .wallets
+        .iter()
+        .find(|w| w.duel.as_ref().is_some_and(|d| !d.side_is_a))
+        .or_else(|| st.wallets.get(1))?;
+    let a_duel = a_stat.duel.clone().unwrap_or_default();
+    let b_duel = b_stat.duel.clone().unwrap_or_default();
+    let outcomes = block_outcomes(&a_duel.positions, &b_duel.positions);
+    let tally = tally_blocks(&outcomes);
+    let verdict = duel_verdict(&a_duel.stats, &b_duel.stats, &tally);
+    Some(DuelSummary {
+        interval_ms: dv.interval_ms,
+        elapsed_secs: st.t0.elapsed().as_secs(),
+        a: DuelSideView {
+            side: DuelSide::A,
+            wallet: a_stat.label.clone(),
+            choice: dv.a.0,
+            bid: dv.a.1,
+            stats: a_duel.stats,
+            spent_grains: a_stat.spent_grains,
+            wins: tally.a_wins,
+            last: a_duel.last,
+            waiting: a_stat
+                .waiting
+                .clone()
+                .or_else(|| a_stat.done_reason.clone())
+                .or_else(|| a_stat.fault.clone()),
+        },
+        b: DuelSideView {
+            side: DuelSide::B,
+            wallet: b_stat.label.clone(),
+            choice: dv.b.0,
+            bid: dv.b.1,
+            stats: b_duel.stats,
+            spent_grains: b_stat.spent_grains,
+            wins: tally.b_wins,
+            last: b_duel.last,
+            waiting: b_stat
+                .waiting
+                .clone()
+                .or_else(|| b_stat.done_reason.clone())
+                .or_else(|| b_stat.fault.clone()),
+        },
+        outcomes,
+        tally,
+        verdict,
+        limits: dv.limits,
+        note: duel_bid_note(dv.a.1, dv.b.1),
+    })
 }
 
 impl Drop for CannonApp {
@@ -1475,6 +1815,21 @@ struct WorkerState {
     /// the bare action: a cannon spanning the activation starts tipping by itself,
     /// and never emits a tip a dormant node would reject.
     auction_active: bool,
+    /// This worker's clock origin, so every duel timestamp is on one monotonic
+    /// scale (submit and landing are measured against the same zero).
+    t0: Instant,
+    /// The duel measurement, present only for a duel worker.
+    duel: Option<DuelTrack>,
+}
+
+/// One duel side's measurement state inside its worker.
+struct DuelTrack {
+    /// Submitted / landed / waited, fed only by chain observations.
+    ledger: DuelLedger,
+    /// The highest block height whose BODY has been read. `None` until the first
+    /// sync, which anchors it at the tip so the run only ever measures its own
+    /// transactions.
+    last_scanned: Option<u64>,
 }
 
 /// The firing worker for ONE wallet: owns a `Zeroizing` copy of that wallet's
@@ -1517,6 +1872,11 @@ fn run_worker(
         sent: 0,
         spent_grains: 0,
         auction_active: false,
+        t0: Instant::now(),
+        duel: cfg.duel.map(|_| DuelTrack {
+            ledger: DuelLedger::new(),
+            last_scanned: None,
+        }),
     };
 
     match cfg.mode {
@@ -1531,6 +1891,18 @@ fn run_worker(
         } => run_heartbeat(
             &cfg,
             Heartbeat::new(interval_ms, jitter_pct),
+            &mut ws,
+            &status,
+            &stop,
+            &ctx,
+        ),
+        // A duel side runs the heartbeat loop — the same pacer, the same rails —
+        // with jitter forced OFF and the interval NOT divided across the wallets,
+        // so both sides beat at the same instants and their transactions reach the
+        // mempool together and compete for the same block.
+        RateMode::Duel { interval_ms, .. } => run_heartbeat(
+            &cfg,
+            Heartbeat::new(interval_ms, 0),
             &mut ws,
             &status,
             &stop,
@@ -1701,12 +2073,20 @@ fn run_heartbeat(
     let started = Instant::now();
     let mut last_sync: Option<Instant> = None;
     let now_ms = |t: Instant| t.elapsed().as_millis() as u64;
+    // A duel measures time-to-land, so it reconciles more often: the sooner a
+    // landing is observed, the tighter the measurement. Everything else about the
+    // loop is identical, which is why the duel reuses it.
+    let sync_interval = if cfg.duel.is_some() {
+        DUEL_SYNC_INTERVAL
+    } else {
+        HEARTBEAT_SYNC_INTERVAL
+    };
 
     while !stop.load(Ordering::SeqCst) {
         // Reconcile on the usual cadence, and ALWAYS before a beat, so the nonce
         // and balance behind a send are never older than one interval.
         let due_sync = last_sync
-            .map(|t| t.elapsed() >= HEARTBEAT_SYNC_INTERVAL)
+            .map(|t| t.elapsed() >= sync_interval)
             .unwrap_or(true);
         if due_sync {
             if !sync_with_node(cfg, ws, status) {
@@ -1733,7 +2113,7 @@ fn run_heartbeat(
             let wait = Duration::from_millis(hb.wait_ms(now_ms(started)));
             // Never sleep past a reconcile, nor past one whole interval — a fast
             // cadence stays responsive, a slow one still re-reads the node.
-            let cap = HEARTBEAT_SYNC_INTERVAL.min(Duration::from_millis(hb.interval_ms()));
+            let cap = sync_interval.min(Duration::from_millis(hb.interval_ms()));
             sleep_interruptible(stop, wait.min(cap));
             continue;
         }
@@ -1841,8 +2221,73 @@ fn sync_with_node(cfg: &WorkerConfig, ws: &mut WorkerState, status: &Arc<Mutex<S
     if let Some(active) = fee_auction_active(&ws.client) {
         ws.auction_active = active;
     }
+    // Duel only: turn the fresh height + nonce into LANDING measurements. Order
+    // matters — the height was read after the nonce, so a nonce that has advanced
+    // was mined in a block at or below the height we now hold.
+    measure_duel_landings(cfg, ws);
     publish_wallet_stat(cfg, ws, status, None);
     true
+}
+
+/// Record this side's landings, for a DUEL worker only (a no-op otherwise).
+///
+/// Two observations, in order of precision:
+///  1. **block bodies** — read every block since the last scan and look for this
+///     side's signer. That gives the exact height AND the transaction's index in
+///     the block's execution order, which is the only way to see which side the
+///     miner scheduled first inside a block they shared.
+///  2. **the account nonce** — anything the scan missed (a skipped catch-up, an
+///     unreadable block) is still known to have been mined once the node's own
+///     account nonce passes it. Those landings count, with no ordering claimed.
+///
+/// The scan is anchored at the tip on the first sync, so a duel only ever
+/// measures transactions it submitted itself.
+fn measure_duel_landings(cfg: &WorkerConfig, ws: &mut WorkerState) {
+    if ws.duel.is_none() {
+        return;
+    }
+    let tip = ws.height;
+    let now_ms = ws.t0.elapsed().as_millis() as u64;
+    // Which heights to read. First sync: none — anchor at the tip.
+    let range = {
+        let track = ws.duel.as_mut().expect("checked above");
+        match track.last_scanned {
+            None => {
+                track.last_scanned = Some(tip);
+                None
+            }
+            Some(last) if tip > last => {
+                // Bound the catch-up: never read an unbounded backlog of bodies.
+                let from = (last + 1).max(tip.saturating_sub(DUEL_SCAN_MAX_BLOCKS - 1));
+                Some(from..=tip)
+            }
+            Some(_) => None,
+        }
+    };
+    if let Some(range) = range {
+        for h in range {
+            // A block we cannot read leaves `last_scanned` behind it, so the next
+            // pass retries it; the nonce sweep below still catches the landing.
+            if let Ok(Some(block)) = ws.client.block_by_height(h) {
+                let txs = block.transactions.len();
+                let hits: Vec<(u64, usize)> = block
+                    .transactions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, stx)| stx.transaction.signer == cfg.from)
+                    .map(|(i, stx)| (stx.transaction.nonce, i))
+                    .collect();
+                let track = ws.duel.as_mut().expect("checked above");
+                for (nonce, index) in hits {
+                    track.ledger.on_block_hit(h, nonce, index, txs, now_ms);
+                }
+                track.last_scanned = Some(h);
+            }
+        }
+    }
+    if let (Some(node_nonce), Some(track)) = (ws.node_nonce, ws.duel.as_mut()) {
+        track.ledger.on_node_nonce(node_nonce, now_ms, tip);
+    }
 }
 
 /// Whether the node reports the `fee-auction` (blockspace-auction) deployment as
@@ -1887,6 +2332,14 @@ fn publish_wallet_stat(
             if let Some(n) = ws.node_nonce {
                 wstat.first_node_nonce.get_or_insert(n);
                 wstat.node_nonce = Some(n);
+            }
+            if let (Some(side), Some(track)) = (cfg.duel, ws.duel.as_ref()) {
+                wstat.duel = Some(DuelSideStat {
+                    side_is_a: side == DuelSide::A,
+                    stats: track.ledger.stats(),
+                    positions: track.ledger.positions(),
+                    last: track.ledger.landings().back().copied(),
+                });
             }
             match note {
                 Some(WalletNote::Waiting(why)) => wstat.waiting = Some(why),
@@ -2013,6 +2466,7 @@ fn fire_once(
             if commit_on_accept {
                 ws.seq.advance();
             }
+            duel_submitted(ws, nonce);
             log_tx(
                 status,
                 cfg,
@@ -2046,6 +2500,10 @@ fn fire_once(
                     if commit_on_accept {
                         ws.seq.advance();
                     }
+                    // The slot is consumed by one of OUR earlier submits (a
+                    // transport failure that actually landed), so the duel must
+                    // still expect that nonce to be mined.
+                    duel_submitted(ws, nonce);
                     publish_wallet_stat(cfg, ws, status, None);
                     FireResult::Continue
                 }
@@ -2089,6 +2547,21 @@ fn fire_once(
 /// amount + estimated fee + tip (the affordability pre-check), and add the same
 /// cost to this run's spend — the figure the heartbeat's spend cap and the
 /// "spent so far" readout are both taken from.
+/// Tell this side's duel ledger that `nonce` is now on the wire, stamped on the
+/// worker's own monotonic clock and at the tip height it was submitted against —
+/// the start of the time-to-land measurement. A no-op outside a duel.
+///
+/// A DRY RUN records nothing: nothing was submitted, so there is nothing pooled
+/// and nothing that can land. The panel says so rather than showing a backlog
+/// that does not exist.
+fn duel_submitted(ws: &mut WorkerState, nonce: u64) {
+    let at_ms = ws.t0.elapsed().as_millis() as u64;
+    let height = ws.height;
+    if let Some(track) = ws.duel.as_mut() {
+        track.ledger.on_submit(nonce, at_ms, height);
+    }
+}
+
 fn debit(ws: &mut WorkerState, amount: u128, tip: u128) {
     let cost = amount
         .saturating_add(FEE_ESTIMATE_GRAINS)
@@ -2708,6 +3181,277 @@ fn draw_heartbeat_card(ui: &mut Ui, hb: &HeartbeatSummary) {
         });
 }
 
+/// The duel readout: the two sides side by side, the per-block record, and the
+/// verdict the measurements support.
+///
+/// Every number here came off the chain. `landed` is a transaction found in a
+/// mined block (or proven mined by the account nonce); `pooled` is submitted and
+/// not yet mined; the waits are measured between those two observations. The
+/// verdict says "inconclusive" until there is enough of it, and reports a result
+/// that contradicts the premise just as plainly as one that confirms it.
+fn draw_duel_card(ui: &mut Ui, d: &DuelSummary) {
+    card_frame()
+        .stroke(Stroke::new(1.0, palette::MAGENTA.gamma_multiply(0.55)))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width() - 4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("⚔").monospace().color(palette::MAGENTA));
+                eyebrow(ui, "auction duel");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(fmt_elapsed(d.elapsed_secs))
+                            .monospace()
+                            .small()
+                            .color(palette::DIM),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "one pair every {}",
+                            fmt_secs(d.interval_ms as f64 / 1_000.0)
+                        ))
+                        .small()
+                        .monospace()
+                        .color(palette::FAINT),
+                    )
+                    .on_hover_text(
+                        "Both sides beat on this same interval, un-jittered, so the pair reaches \
+                         the mempool together and competes for the same blockspace.",
+                    );
+                });
+            });
+            ui.add_space(6.0);
+
+            // --- the two sides, side by side ----------------------------
+            let sides = [&d.a, &d.b];
+            ui.columns(2, |c| {
+                for (i, s) in sides.iter().enumerate() {
+                    draw_duel_side(&mut c[i], s);
+                }
+            });
+
+            // --- per-block record ---------------------------------------
+            ui.add_space(6.0);
+            eyebrow(ui, "blocks");
+            if d.outcomes.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "no block has included either side yet — nothing to compare so far",
+                    )
+                    .small()
+                    .color(palette::FAINT),
+                );
+            } else {
+                // Newest last, and only as many as fit the panel comfortably.
+                let shown: Vec<&BlockOutcome> = d.outcomes.iter().rev().take(12).rev().collect();
+                for o in shown {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("#{}", o.height))
+                                .monospace()
+                                .small()
+                                .color(palette::DIM),
+                        );
+                        let cell = |ui: &mut Ui, n: u64, color: Color32| {
+                            ui.label(
+                                RichText::new(if n == 0 {
+                                    "·".to_string()
+                                } else {
+                                    format!("{n}")
+                                })
+                                .monospace()
+                                .small()
+                                .color(if n == 0 {
+                                    palette::FAINT
+                                } else {
+                                    color
+                                }),
+                            );
+                        };
+                        ui.label(RichText::new("A").small().color(palette::FAINT));
+                        cell(ui, o.a, palette::CYAN);
+                        ui.label(RichText::new("B").small().color(palette::FAINT));
+                        cell(ui, o.b, palette::AMBER);
+                        ui.label(
+                            RichText::new(match (o.a > 0, o.b > 0, o.first) {
+                                (true, false, _) => "A only".to_string(),
+                                (false, true, _) => "B only".to_string(),
+                                (true, true, Some(side)) => {
+                                    format!("both — {} ordered first", side.short())
+                                }
+                                (true, true, None) => "both — ordering not observed".to_string(),
+                                (false, false, _) => String::new(),
+                            })
+                            .small()
+                            .color(palette::DIM),
+                        );
+                    });
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "{} blocks in the sample · A only {} · B only {} · both {} (A first {} · B \
+                         first {})",
+                        d.tally.blocks,
+                        d.tally.a_wins,
+                        d.tally.b_wins,
+                        d.tally.shared,
+                        d.tally.a_first,
+                        d.tally.b_first
+                    ))
+                    .small()
+                    .monospace()
+                    .color(palette::FAINT),
+                );
+            }
+
+            // --- the verdict --------------------------------------------
+            ui.add_space(6.0);
+            let color = match d.verdict {
+                Verdict::Inconclusive(_) => palette::FAINT,
+                Verdict::HigherBid(_) => palette::GREEN,
+                Verdict::NoDifference(_) => palette::CYAN,
+                Verdict::Contrary(_) => palette::AMBER,
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(d.verdict.word())
+                        .monospace()
+                        .small()
+                        .strong()
+                        .color(color),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(d.verdict.text()).small().color(palette::TEXT));
+            });
+            if let Some(note) = d.note {
+                ui.label(
+                    RichText::new(format!("⚠ {note}"))
+                        .small()
+                        .color(palette::AMBER),
+                );
+            }
+            // The rails this run is held to — the same for both sides.
+            ui.label(
+                RichText::new(format!(
+                    "each side keeps at least {} XUS{}{}",
+                    fmt_xus(d.limits.reserve_grains),
+                    d.limits
+                        .max_tx
+                        .map(|n| format!(" · cap {} tx/side", fmt_count(n)))
+                        .unwrap_or_default(),
+                    d.limits
+                        .max_spend_grains
+                        .map(|g| format!(" · cap {} XUS/side", fmt_xus(g)))
+                        .unwrap_or_default(),
+                ))
+                .small()
+                .monospace()
+                .color(palette::FAINT),
+            );
+        });
+}
+
+/// One side's column in the duel panel.
+fn draw_duel_side(ui: &mut Ui, s: &DuelSideView) {
+    let accent = if s.side == DuelSide::A {
+        palette::CYAN
+    } else {
+        palette::AMBER
+    };
+    card_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.vertical(|ui| {
+            ui.label(
+                RichText::new(s.side.label())
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(accent),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{} · {}", duel_bid_label(s.bid), s.choice.label()))
+                        .monospace()
+                        .small()
+                        .color(palette::DIM),
+                )
+                .truncate(),
+            );
+            ui.add(
+                egui::Label::new(RichText::new(&s.wallet).small().color(palette::FAINT)).truncate(),
+            );
+            ui.add_space(4.0);
+            let row = |ui: &mut Ui, label: &str, value: String, color: Color32| {
+                ui.horizontal(|ui| {
+                    ui.allocate_ui(Vec2::new(88.0, 0.0), |ui| {
+                        ui.label(RichText::new(label).small().color(palette::DIM));
+                    });
+                    ui.label(RichText::new(value).monospace().color(color));
+                });
+            };
+            row(
+                ui,
+                "submitted",
+                fmt_count(s.stats.submitted),
+                palette::VIOLET,
+            );
+            row(ui, "landed", fmt_count(s.stats.landed), palette::GREEN);
+            row(ui, "pooled", fmt_count(s.stats.pooled), palette::AMBER);
+            row(
+                ui,
+                "waited",
+                match (s.stats.mean_blocks, s.stats.mean_secs) {
+                    (Some(b), Some(sec)) => format!("{b:.1} blk · {sec:.0} s"),
+                    // Nothing landed: an explicit dash, never a zero wait.
+                    _ => "—".to_string(),
+                },
+                accent,
+            );
+            row(ui, "blocks won", fmt_count(s.wins), accent);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(match s.last {
+                        // The exact observation, including where in the block the
+                        // miner put it when the block body gave us that.
+                        Some(l) => match (l.index, l.txs) {
+                            (Some(i), Some(n)) => format!(
+                                "last landed in #{} at position {} of {}",
+                                l.height,
+                                i + 1,
+                                n
+                            ),
+                            _ => format!("last landed by #{} (position not observed)", l.height),
+                        },
+                        None => "nothing landed yet".to_string(),
+                    })
+                    .small()
+                    .color(palette::FAINT),
+                )
+                .truncate(),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{} XUS spent", fmt_xus(s.spent_grains)))
+                        .monospace()
+                        .small()
+                        .color(palette::FAINT),
+                )
+                .truncate(),
+            );
+            if let Some(why) = &s.waiting {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("⏸ {why}"))
+                            .small()
+                            .color(palette::AMBER),
+                    )
+                    .truncate(),
+                );
+            }
+        });
+    });
+}
+
 /// One row of the outcome breakdown: a labelled proportional bar.
 #[allow(clippy::too_many_arguments)]
 fn outcome_row(
@@ -2765,6 +3509,8 @@ enum OpState {
     Firing,
     /// A heartbeat is running: the indefinite trickle, beating.
     Beating,
+    /// An auction duel is running: two wallets, one variable — the bid.
+    Duelling,
     /// Every worker is parked on a safety rail (the balance floor) — running, but
     /// deliberately not sending. Distinct from both firing and an error.
     Paused,
@@ -2781,6 +3527,7 @@ impl OpState {
             OpState::Ready => "◆",
             OpState::Firing => "▶",
             OpState::Beating => "♥",
+            OpState::Duelling => "⚔",
             OpState::Paused => "⏸",
             OpState::Draining => "◐",
             OpState::Stopped => "■",
@@ -2792,6 +3539,7 @@ impl OpState {
             OpState::Ready => "READY",
             OpState::Firing => "FIRING",
             OpState::Beating => "HEARTBEAT",
+            OpState::Duelling => "DUEL",
             OpState::Paused => "PAUSED",
             OpState::Draining => "STOPPING",
             OpState::Stopped => "STOPPED",
@@ -2805,6 +3553,7 @@ impl OpState {
             OpState::Ready => palette::CYAN,
             OpState::Firing => palette::GREEN,
             OpState::Beating => palette::VIOLET,
+            OpState::Duelling => palette::MAGENTA,
             OpState::Paused => palette::AMBER,
             OpState::Draining => palette::AMBER,
             OpState::Stopped => palette::DIM,
@@ -2812,7 +3561,10 @@ impl OpState {
     }
     /// Whether workers are alive in this state (firing, beating or parked).
     fn is_live(self) -> bool {
-        matches!(self, OpState::Firing | OpState::Beating | OpState::Paused)
+        matches!(
+            self,
+            OpState::Firing | OpState::Beating | OpState::Duelling | OpState::Paused
+        )
     }
 }
 
@@ -2921,16 +3673,17 @@ impl eframe::App for CannonApp {
         };
         // A live run is FIRING, or BEATING when it is a heartbeat, or PAUSED when
         // every live worker is parked on a rail rather than sending.
-        let (heartbeat, all_parked) = match self.status.lock() {
+        let (heartbeat, duelling, all_parked) = match self.status.lock() {
             Ok(st) => (
                 st.heartbeat,
+                st.duel.is_some(),
                 !st.wallets.is_empty()
                     && st
                         .wallets
                         .iter()
                         .all(|w| w.ended || w.waiting.is_some() || w.fault.is_some()),
             ),
-            Err(_) => (None, false),
+            Err(_) => (None, false, false),
         };
         // A form field that will not parse is a REASON the cannon cannot fire, so
         // it disables Start and explains itself there, rather than being discovered
@@ -2939,6 +3692,8 @@ impl eframe::App for CannonApp {
         let state = if running {
             if all_parked {
                 OpState::Paused
+            } else if duelling {
+                OpState::Duelling
             } else if heartbeat.is_some() {
                 OpState::Beating
             } else {
@@ -3227,6 +3982,20 @@ impl CannonApp {
                     None => "heartbeat running".into(),
                 }
             }
+            // The duel's headline IS its verdict: the numbers so far, or an
+            // explicit "inconclusive" when there are not yet enough of them.
+            OpState::Duelling => match self.duel_summary() {
+                Some(d) => format!(
+                    "{} · A {} landed / {} pooled · B {} landed / {} pooled — {}",
+                    d.verdict.word(),
+                    d.a.stats.landed,
+                    d.a.stats.pooled,
+                    d.b.stats.landed,
+                    d.b.stats.pooled,
+                    d.verdict.text()
+                ),
+                None => "auction duel running".into(),
+            },
             OpState::Paused => self
                 .status
                 .lock()
@@ -3346,12 +4115,20 @@ impl CannonApp {
                                      Runs until you stop it, with a balance floor and optional \
                                      session caps. Not a load test.",
                                 ),
+                                (
+                                    ModeChoice::Duel,
+                                    "⚔ Auction duel",
+                                    "A controlled A-vs-B test of the blockspace fee auction. \
+                                     EXACTLY two wallets: both fire the same cadence, the same \
+                                     amounts, to the same destinations — only the BID differs. \
+                                     Measures which side lands sooner, and how often.",
+                                ),
                             ] {
                                 let on = self.mode == choice;
-                                let accent = if choice == ModeChoice::Heartbeat {
-                                    palette::VIOLET
-                                } else {
-                                    palette::CYAN
+                                let accent = match choice {
+                                    ModeChoice::Heartbeat => palette::VIOLET,
+                                    ModeChoice::Duel => palette::MAGENTA,
+                                    _ => palette::CYAN,
                                 };
                                 let text = RichText::new(label)
                                     .monospace()
@@ -3448,6 +4225,29 @@ impl CannonApp {
                                 };
                                 ui.label(RichText::new(text).small().color(color));
                             }
+                            ModeChoice::Duel => {
+                                // ONE cadence for both sides — there is no
+                                // per-side pacing control, by design.
+                                ui.label(
+                                    RichText::new("one pair every")
+                                        .small()
+                                        .color(palette::DIM),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.duel_every_secs)
+                                        .desired_width(52.0)
+                                        .font(egui::TextStyle::Monospace),
+                                );
+                                ui.label(RichText::new("s").small().color(palette::FAINT));
+                                let (text, color) = match self
+                                    .parse_duel_cadence()
+                                    .and_then(|c| c.interval_ms().map(|_| c.describe()))
+                                {
+                                    Ok(d) => (format!("per side · {d}"), palette::DIM),
+                                    Err(e) => (e, palette::RED),
+                                };
+                                ui.label(RichText::new(text).small().color(color));
+                            }
                         }
                     });
 
@@ -3513,6 +4313,11 @@ impl CannonApp {
                         "Runs INDEFINITELY at the cadence above, self-pacing against an ideal schedule so it neither \
                          drifts nor bunches, jittered so it is not a metronome. Node hiccups are backed off and \
                          resynced, never fatal. It pauses at the balance floor and stops at any session cap you set.",
+                    ModeChoice::Duel =>
+                        "A CONTROLLED experiment on the fee auction: exactly two wallets, side A and side B, firing the \
+                         same cadence off the same clock, the same amounts, to the same destinations, under the same rails. \
+                         The ONLY difference is the bid — so whatever the measurements show can be attributed to it. \
+                         Landed is read from the chain (block bodies, then the account nonce), never from mempool acceptance.",
                 };
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(consequence).small().color(palette::FAINT));
@@ -3878,6 +4683,276 @@ impl CannonApp {
             self.heartbeat_card(ui, running);
             ui.add_space(8.0);
         }
+
+        // 4. Auction duel — the two sides' bids and the shared rails.
+        if self.mode == ModeChoice::Duel {
+            self.duel_card(ui, running);
+            ui.add_space(8.0);
+        }
+    }
+
+    /// The duel's own settings: the two bids (the only thing that differs between
+    /// the sides) and the rails each side is independently protected by. The
+    /// cadence lives in the control bar with every other mode's parameter.
+    fn duel_card(&mut self, ui: &mut Ui, running: bool) {
+        let auction = self.conn.lock().ok().and_then(|c| c.auction_active);
+        let selected = self.selected_count();
+        card_frame()
+            .stroke(Stroke::new(1.0, palette::MAGENTA.gamma_multiply(0.45)))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 4.0);
+                eyebrow(ui, "4 · auction duel");
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Two wallets. One variable: the bid.")
+                        .monospace()
+                        .color(palette::MAGENTA),
+                );
+                ui.label(
+                    RichText::new(
+                        "Both sides fire the same cadence off the same clock, the same amounts, to \
+                         the same destinations, under the same rails — so what the numbers show can \
+                         be attributed to the bid and to nothing else.",
+                    )
+                    .small()
+                    .color(palette::FAINT),
+                );
+
+                // --- the two-wallet requirement, stated either way ----------
+                ui.add_space(6.0);
+                match duel_wallet_check(selected) {
+                    Some(b) => {
+                        ui.label(RichText::new(format!("✖ {}", b.message())).small().color(palette::RED));
+                    }
+                    None => {
+                        let (a, b) = self.side_wallets();
+                        ui.label(
+                            RichText::new(format!("A ▸ {a}   ·   B ▸ {b}"))
+                                .monospace()
+                                .small()
+                                .color(palette::DIM),
+                        )
+                        .on_hover_text(
+                            "The first checked wallet fires side A, the second fires side B. Both \
+                             need a spendable balance.",
+                        );
+                    }
+                }
+
+                ui.add_enabled_ui(!running, |ui| {
+                    // --- per-side bids ---------------------------------------
+                    for side in [DuelSide::A, DuelSide::B] {
+                        ui.add_space(6.0);
+                        let accent = if side == DuelSide::A {
+                            palette::CYAN
+                        } else {
+                            palette::AMBER
+                        };
+                        ui.label(
+                            RichText::new(side.label())
+                                .small()
+                                .monospace()
+                                .color(accent),
+                        );
+                        let bid = if side == DuelSide::A {
+                            &mut self.duel_a
+                        } else {
+                            &mut self.duel_b
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            for choice in [TipChoice::Auto, TipChoice::Manual, TipChoice::NoTip] {
+                                let on = bid.choice == choice;
+                                let btn = egui::Button::new(
+                                    RichText::new(choice.label())
+                                        .monospace()
+                                        .small()
+                                        .color(if on { Color32::BLACK } else { palette::DIM }),
+                                )
+                                .fill(if on { accent } else { palette::SURFACE_HI })
+                                .min_size(Vec2::new(0.0, MODE_BTN_H));
+                                if ui.add(btn).on_hover_text(choice.consequence()).clicked() {
+                                    bid.choice = choice;
+                                }
+                            }
+                        });
+                        if bid.choice == TipChoice::Manual {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut bid.random, RichText::new("range").small())
+                                    .on_hover_text(
+                                        "Draw this side's bid uniformly from [min, max] instead of \
+                                         bidding one fixed value.",
+                                    );
+                                if bid.random {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut bid.min)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(66.0),
+                                    );
+                                    ui.label(RichText::new("–").small().color(palette::FAINT));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut bid.max)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(66.0),
+                                    );
+                                } else {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut bid.fixed)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(80.0),
+                                    );
+                                }
+                                ui.label(RichText::new("XUS").small().color(palette::FAINT));
+                            });
+                        }
+                        let resolved = bid.resolve().map(|(c, m)| heartbeat_tip_mode(c, m));
+                        ui.label(
+                            RichText::new(match &resolved {
+                                Ok(m) => format!("bids {} per transaction", duel_bid_label(*m)),
+                                Err(e) => format!("✖ {e}"),
+                            })
+                            .monospace()
+                            .small()
+                            .color(if resolved.is_ok() {
+                                palette::DIM
+                            } else {
+                                palette::RED
+                            }),
+                        );
+                    }
+
+                    // --- is the comparison meaningful on THIS node? ----------
+                    ui.add_space(6.0);
+                    if let Ok((a, b)) = self.parse_duel_bids() {
+                        if let Some(note) = duel_bid_note(a, b) {
+                            ui.label(RichText::new(format!("⚠ {note}")).small().color(palette::AMBER));
+                        }
+                    }
+                    let (hint, color) = match auction {
+                        Some(true) => (
+                            "fee-auction is ACTIVE on this node — both bids are attached and the \
+                             two sides really do compete."
+                                .to_string(),
+                            palette::GREEN,
+                        ),
+                        Some(false) => (
+                            "fee-auction is DORMANT on this node: NEITHER side can attach a bid, so \
+                             the two sides are identical and the duel cannot measure the auction. \
+                             The run is still safe — it just has nothing to compare."
+                                .to_string(),
+                            palette::AMBER,
+                        ),
+                        None => (
+                            "fee-auction state unknown (the node has not answered \
+                             sov_getDeployments yet)."
+                                .to_string(),
+                            palette::FAINT,
+                        ),
+                    };
+                    ui.label(RichText::new(hint).small().color(color));
+                    if self.dry_run {
+                        ui.label(
+                            RichText::new(
+                                "DRY RUN builds and signs both sides but submits nothing, so there \
+                                 is nothing to land and nothing to measure. Arm LIVE FIRE to run \
+                                 the experiment.",
+                            )
+                            .small()
+                            .color(palette::AMBER),
+                        );
+                    }
+
+                    // --- the rails, per side ---------------------------------
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Safety rails (each side, independently)").small().color(palette::DIM));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("keep at least").small().color(palette::DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.hb_reserve)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(74.0),
+                        );
+                        ui.label(RichText::new("XUS").small().color(palette::FAINT));
+                    })
+                    .response
+                    .on_hover_text(
+                        "The balance floor, applied to EACH side's wallet. That side pauses rather \
+                         than going below it, and resumes by itself if the balance recovers.",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.hb_cap_tx_on, RichText::new("stop after").small());
+                        ui.add_enabled(
+                            self.hb_cap_tx_on,
+                            egui::TextEdit::singleline(&mut self.hb_cap_tx)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(74.0),
+                        );
+                        ui.label(RichText::new("tx (both sides)").small().color(palette::FAINT));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.hb_cap_spend_on, RichText::new("stop after").small());
+                        ui.add_enabled(
+                            self.hb_cap_spend_on,
+                            egui::TextEdit::singleline(&mut self.hb_cap_spend)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(74.0),
+                        );
+                        ui.label(
+                            RichText::new("XUS spent (both sides)")
+                                .small()
+                                .color(palette::FAINT),
+                        );
+                    });
+                    if let Err(e) = self.parse_limits() {
+                        ui.label(RichText::new(format!("✖ {e}")).small().color(palette::RED));
+                    }
+                    // What the experiment costs, from the numbers on screen.
+                    if let (Ok(interval), Ok((a, b))) = (
+                        self.parse_duel_cadence().and_then(|c| c.interval_ms()),
+                        self.parse_duel_bids(),
+                    ) {
+                        let per_day = 86_400_000f64 / interval as f64;
+                        let worst = |m: TipMode| match m {
+                            TipMode::Off => 0,
+                            TipMode::Fixed(v) => v,
+                            TipMode::Range { max, .. } => max,
+                        };
+                        let amount = match self.parse_amount_mode() {
+                            Ok(AmountMode::Fixed(v)) => v,
+                            Ok(AmountMode::Range { max, .. }) => max,
+                            Err(_) => 0,
+                        };
+                        let per_pair = amount
+                            .saturating_mul(2)
+                            .saturating_add(FEE_ESTIMATE_GRAINS.saturating_mul(2))
+                            .saturating_add(worst(a))
+                            .saturating_add(worst(b));
+                        ui.label(
+                            RichText::new(format!(
+                                "≈ {} pairs/day · up to {} XUS/day across both sides",
+                                fmt_count(per_day.round() as u64),
+                                fmt_xus((per_pair as f64 * per_day) as u128)
+                            ))
+                            .small()
+                            .monospace()
+                            .color(palette::DIM),
+                        );
+                    }
+                });
+            });
+    }
+
+    /// The labels of the wallets that will fire side A and side B, in selection
+    /// order. Only meaningful once exactly two are checked.
+    fn side_wallets(&self) -> (String, String) {
+        let mut it = self
+            .wallets
+            .iter()
+            .filter(|w| w.fire)
+            .map(|w| w.label.clone());
+        (
+            it.next().unwrap_or_else(|| "—".into()),
+            it.next().unwrap_or_else(|| "—".into()),
+        )
     }
 
     /// The heartbeat's own settings: whether it exercises the fee auction, and the
@@ -4131,6 +5206,7 @@ impl CannonApp {
         };
         let now = st.now_ms();
         let heartbeat = heartbeat_summary_of(&st);
+        let duel = duel_summary_of(&st);
         let ever_ran = self.last_run.is_some() || st.running;
         let r = |k: MeterKind| {
             if ever_ran {
@@ -4237,6 +5313,14 @@ impl CannonApp {
         // heartbeat is running, cadence is the thing the operator watches.
         if let Some(hb) = &heartbeat {
             draw_heartbeat_card(ui, hb);
+            ui.add_space(8.0);
+        }
+
+        // --- 1c. the duel readout (only while one is running) ------------
+        // The comparison is the deliverable of that mode, so it sits where the
+        // operator is already looking.
+        if let Some(d) = &duel {
+            draw_duel_card(ui, d);
             ui.add_space(8.0);
         }
 
