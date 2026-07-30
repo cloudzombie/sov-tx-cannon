@@ -31,7 +31,7 @@ repository boundary is stated in [AGENTS.md](AGENTS.md).
   is **no reimplemented crypto, keystore, id, or codec logic in this crate** —
   that is the single most important property of this tool and it is enforced by
   the dependency pin, not by convention.
-- **Four rate modes.**
+- **Five rate modes.**
   - *Per block* — fire N transactions on each new chain tip.
   - *Target TX/s* — a paced, block-independent rate (cumulative-due scheduler
     with bounded catch-up).
@@ -40,6 +40,8 @@ repository boundary is stated in [AGENTS.md](AGENTS.md).
     nonce on those, self-pacing to the node's drain rate.
   - *Heartbeat* — a gentle, indefinite trickle that keeps blocks non-empty, with
     safety rails; see [Heartbeat mode](#heartbeat-mode).
+  - *Auction duel* — a controlled A-vs-B experiment on the blockspace fee
+    auction with **exactly two wallets**; see [Auction duel mode](#auction-duel-mode).
 - **Blockspace-auction tips.** Optionally attach a priority tip to each
   transaction (SOV v0.1.98 `Action::Tipped`), fixed or drawn from a range so a
   fleet spreads a realistic spectrum of bids across the dynamic fee floor. The
@@ -111,6 +113,60 @@ Heartbeat is the *constant stream* mode: chain liveness rather than load. It run
 - **Landed means mined.** The "landed" figure comes from the node's own account
   nonce, not from mempool acceptance, so it is the honest count of transactions the
   chain actually included.
+
+### Auction duel mode
+
+The duel exists to answer one question with evidence: **on this chain, right now,
+does bidding more in the blockspace auction get a transaction mined sooner?**
+
+It is a *controlled experiment*, which is why it is its own mode rather than a
+setting.
+
+- **Exactly two wallets, enforced.** Fewer or more and the mode refuses to arm,
+  and Start is disabled with the reason stated: one wallet is not a contest, and
+  a third sender would add traffic that is neither side, so the bid would no
+  longer be the only variable. The first checked wallet fires **side A (high
+  bid)**, the second **side B (low bid)**.
+- **Everything except the bid is held equal.** Both sides run the heartbeat
+  pacer on the **same interval** (default: one pair every 60 s ≈ 2.5 pairs per
+  block) with **jitter forced off**, so the pair reaches the mempool together and
+  competes for the *same* blockspace. Same amount policy, same destination policy
+  and order, same node, same rails, same nonce discipline.
+- **Per-side bids, same machinery as everywhere else.** Each side picks auto
+  (suggested tip), manual (its own fixed value or range), or **no tip** (the bare
+  action, no `Tipped` envelope). The default is the configuration that
+  demonstrates the auction: A bids ten times the suggested tip, B bids nothing.
+  Identical bids are allowed but flagged as a **null (control) run**, because
+  such a run cannot show what a higher bid buys.
+- **The measurement is the deliverable.** Per side, read off the chain and never
+  from mempool acceptance:
+  - **submitted / landed / pooled** — a landing is this side's transaction found
+    in a mined block, or a nonce the node's own account nonce has passed.
+  - **time-to-land** in **blocks and seconds**, from submit to that observation.
+  - **per-block wins** — for each block either side landed in: who was in it, and
+    where both were, **which side the miner ordered first** (taken from the
+    block's execution order, so it is the miner's real schedule). Blocks whose
+    bodies were not read report "ordering not observed" rather than a guess.
+  - a running **verdict**: HIGHER BID WINS / NO DIFFERENCE / CONTRARY /
+    INCONCLUSIVE, computed from those numbers. It stays **INCONCLUSIVE** until at
+    least four landings exist, calls a wait difference under half a block **no
+    difference**, and reports a result that goes the *other* way as CONTRARY
+    rather than explaining it away.
+- **Both sides independently protected.** The heartbeat's rails apply per side:
+  each wallet's balance floor pauses that side (and it resumes by itself), and
+  the optional transaction and spend caps are split across the two so the
+  aggregate is what was typed. Worst-case cost (largest amount + fee + largest
+  bid) is what the rails are checked against.
+- **The dormant-fork gate is unchanged.** If the node does not report
+  `fee-auction` `Active`, **neither** side attaches a bid — the two sides become
+  identical and the panel says so, because the duel then has nothing to measure.
+  A dry run builds and signs both sides but submits nothing, so it also has
+  nothing to measure, and says that too.
+- **Known limits, stated.** Landings are observed by polling (every 5 s against
+  ~150 s blocks) and by reading block bodies with a bounded catch-up, so a
+  blocks-waited figure is exact to within one block, and if the tool falls far
+  behind, the account-nonce sweep still counts those landings but without an
+  intra-block ordering.
 
 ### Closed-loop recycle mode
 
@@ -251,6 +307,25 @@ companion `.sha256` checksum, both attached to the GitHub Release for the tag.
 The macOS job runs `cargo test --locked` on the arm64 runner before packaging,
 so a published binary is one that passed its tests natively on Apple Silicon.
 
+### 0.2.2
+
+- **Auction duel mode** — a dedicated, two-wallet controlled experiment on the
+  blockspace fee auction: both sides fire the same cadence off the same clock,
+  the same amounts, to the same destinations, under the same rails, and **only the
+  bid differs**. It refuses to arm with anything other than exactly two wallets,
+  with the reason stated. See [Auction duel mode](#auction-duel-mode).
+- **Measured outcome, not just traffic** — per side: submitted / landed / pooled,
+  time-to-land in blocks *and* seconds, per-block wins, and the intra-block
+  ordering the miner actually chose (read from the block's execution order). A
+  running verdict is computed from those numbers and reports **INCONCLUSIVE**
+  until the sample supports more, **NO DIFFERENCE** inside the noise floor, and
+  **CONTRARY** when the measurement goes the other way.
+- **Side-by-side operator panel** — the two sides in one A-vs-B card with the
+  per-block record and the verdict line, in the existing design tokens, plus a
+  distinct DUEL run state. The dormant-fork gate is unchanged: on a chain where
+  `fee-auction` is not Active neither side attaches a bid, and the panel says the
+  duel has nothing to measure.
+
 ### 0.2.1
 
 - **Heartbeat (constant stream) mode** — a gentle, indefinite trickle that keeps
@@ -273,7 +348,7 @@ so a published binary is one that passed its tests natively on Apple Silicon.
 To cut a release:
 
 1. Bump `version` in `Cargo.toml`, refresh `Cargo.lock` (`cargo update -p sov-tx-cannon`), and merge that through a PR.
-2. Push a matching tag: `git tag v0.2.1 && git push origin v0.2.1`.
+2. Push a matching tag: `git tag v0.2.2 && git push origin v0.2.2`.
 3. The release workflow builds, tests on arm64, packages, and publishes the
    assets. Do not create tags for unreleased or mismatched versions.
 
