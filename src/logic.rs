@@ -139,6 +139,14 @@ pub enum RateMode {
     /// Submit as fast as sign+POST allows; the mempool's capacity rejections
     /// are the only brake.
     Firehose,
+    /// Keep a gentle, indefinite trickle of real transactions flowing — chain
+    /// liveness rather than load. See [`Heartbeat`] for the pacing model.
+    Heartbeat {
+        /// Target interval between submissions, in milliseconds.
+        interval_ms: u64,
+        /// Symmetric jitter as a percentage of the interval (0 = metronome).
+        jitter_pct: u32,
+    },
 }
 
 /// The Target-TX/s scheduler: given elapsed time since the run started, says how
@@ -184,6 +192,392 @@ impl Pacer {
         self.issued = self.issued.max(target);
         due
     }
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat — the constant, indefinite trickle mode
+// ---------------------------------------------------------------------------
+//
+// The other modes answer "how hard can this chain be pushed". The heartbeat
+// answers a different question: "can this chain be kept ALIVE, gently, forever".
+// It submits a handful of real transactions per block, indefinitely, self-pacing
+// against an ideal schedule so the cadence neither drifts nor bunches, and it
+// stops itself before it can drain the funding wallet.
+
+/// Mainnet target block interval, in seconds (2.5 minutes). The cadence is
+/// expressed in these human terms — "N transactions per block" — and converted
+/// to a submission interval here, in ONE tested place.
+pub const BLOCK_SECS: f64 = 150.0;
+
+/// Narrowest heartbeat interval: one transaction every 5 seconds. The heartbeat
+/// is deliberately not a load test — [`RateMode::TargetTps`] and
+/// [`RateMode::Firehose`] are what push the pool.
+pub const HEARTBEAT_MIN_INTERVAL_MS: u64 = 5_000;
+
+/// Widest heartbeat interval: one transaction an hour.
+pub const HEARTBEAT_MAX_INTERVAL_MS: u64 = 3_600_000;
+
+/// Default jitter, as a percentage of the interval, applied symmetrically
+/// (±20%) so the stream reads as organic rather than as a metronome while the
+/// MEAN cadence is preserved exactly.
+pub const HEARTBEAT_JITTER_PCT: u32 = 20;
+
+/// The suggested ("auto") heartbeat tip, in grains: 0.0005 XUS.
+///
+/// The blockspace auction refuses a bid only when the pool is at CAPACITY, where
+/// the emergent floor is the lowest tip protecting a slot. A live chain running a
+/// heartbeat is nowhere near capacity, so the floor is effectively zero and any
+/// nonzero bid both (a) clears it and (b) orders the heartbeat tx ahead of all
+/// untipped traffic in the miner's schedule. 0.0005 XUS is ~2.4× the intrinsic
+/// fee, so even a week of heartbeat at a few tx per block costs single-digit XUS.
+pub const SUGGESTED_TIP_GRAINS: u128 = 50_000;
+
+/// How the operator expressed the heartbeat cadence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Cadence {
+    /// `n` transactions per block, at the [`BLOCK_SECS`] target block time.
+    PerBlock(f64),
+    /// One transaction every `secs` seconds, independent of blocks.
+    EverySecs(f64),
+}
+
+impl Cadence {
+    /// The submission interval this cadence implies, in milliseconds, or the
+    /// reason it is not a usable cadence. Bounded by
+    /// [`HEARTBEAT_MIN_INTERVAL_MS`] / [`HEARTBEAT_MAX_INTERVAL_MS`] so no UI
+    /// input can ask for a firehose or for a heartbeat that never beats.
+    pub fn interval_ms(self) -> Result<u64, String> {
+        let secs = match self {
+            Cadence::PerBlock(n) => {
+                if !n.is_finite() || n <= 0.0 {
+                    return Err("transactions per block must be greater than zero".into());
+                }
+                BLOCK_SECS / n
+            }
+            Cadence::EverySecs(s) => {
+                if !s.is_finite() || s <= 0.0 {
+                    return Err("the interval must be greater than zero".into());
+                }
+                s
+            }
+        };
+        let ms = (secs * 1_000.0).round();
+        if !ms.is_finite() {
+            return Err("that cadence is not a number".into());
+        }
+        let ms = ms as u64;
+        if ms < HEARTBEAT_MIN_INTERVAL_MS {
+            return Err(format!(
+                "too fast for a heartbeat — keep it at or below one tx every {:.0} s ({:.1} tx/block); use Target TX/s to push harder",
+                HEARTBEAT_MIN_INTERVAL_MS as f64 / 1_000.0,
+                BLOCK_SECS / (HEARTBEAT_MIN_INTERVAL_MS as f64 / 1_000.0),
+            ));
+        }
+        if ms > HEARTBEAT_MAX_INTERVAL_MS {
+            return Err(format!(
+                "too slow — keep it at or under one tx every {:.0} min",
+                HEARTBEAT_MAX_INTERVAL_MS as f64 / 60_000.0,
+            ));
+        }
+        Ok(ms)
+    }
+
+    /// The cadence in both human framings, for the status line.
+    pub fn describe(self) -> String {
+        match self.interval_ms() {
+            Ok(ms) => {
+                let secs = ms as f64 / 1_000.0;
+                format!(
+                    "{:.2} tx/block · one every {}",
+                    BLOCK_SECS / secs,
+                    fmt_secs(secs)
+                )
+            }
+            Err(e) => e,
+        }
+    }
+}
+
+/// A duration in seconds rendered compactly for a cadence readout.
+pub fn fmt_secs(secs: f64) -> String {
+    if secs < 90.0 {
+        format!("{secs:.0} s")
+    } else {
+        format!("{:.1} min", secs / 60.0)
+    }
+}
+
+/// The heartbeat's self-pacing scheduler.
+///
+/// It holds an IDEAL schedule — `anchor + issued × interval` — rather than
+/// sleeping `interval` after each send, so the cadence cannot drift as signing,
+/// RPC latency and back-offs eat time: a submission that lands late is followed
+/// by one that is due immediately, and the long-run rate is exactly the target.
+///
+/// Two properties matter as much as the average, and both are tested:
+///   * **it never bunches** — the deficit it will make up is bounded by one
+///     interval, so at most ONE catch-up submission is ever due at once; and
+///   * **a stall is dropped, not replayed** — if it falls more than one interval
+///     behind (the node was unreachable for a minute, the app was blocked), it
+///     re-anchors on "now" instead of firing the whole backlog at once.
+///
+/// Time is caller-supplied milliseconds (monotonic in production, scripted in
+/// the tests). Jitter is symmetric around the ideal instant, so it changes the
+/// TEXTURE of the stream without changing its rate.
+#[derive(Clone, Debug)]
+pub struct Heartbeat {
+    interval_ms: u64,
+    jitter_pct: u32,
+    /// Origin of the current ideal schedule.
+    anchor_ms: u64,
+    /// Submissions issued since the anchor.
+    issued: u64,
+    /// When the next submission is due (may be in the past ⇒ due now).
+    next_at_ms: u64,
+}
+
+impl Heartbeat {
+    /// A heartbeat at `interval_ms` (clamped into the supported band) with
+    /// `jitter_pct` of symmetric jitter. The first submission is due immediately,
+    /// so the operator sees the stream start rather than waiting out an interval.
+    pub fn new(interval_ms: u64, jitter_pct: u32) -> Self {
+        Self {
+            interval_ms: interval_ms.clamp(HEARTBEAT_MIN_INTERVAL_MS, HEARTBEAT_MAX_INTERVAL_MS),
+            jitter_pct: jitter_pct.min(90),
+            anchor_ms: 0,
+            issued: 0,
+            next_at_ms: 0,
+        }
+    }
+
+    /// The configured interval, in milliseconds.
+    pub fn interval_ms(&self) -> u64 {
+        self.interval_ms
+    }
+
+    /// Whether a submission is due at `now_ms`.
+    pub fn due(&self, now_ms: u64) -> bool {
+        now_ms >= self.next_at_ms
+    }
+
+    /// How long to wait before the next submission is due (zero ⇒ due now).
+    pub fn wait_ms(&self, now_ms: u64) -> u64 {
+        self.next_at_ms.saturating_sub(now_ms)
+    }
+
+    /// Record that a submission actually went out at `now_ms` and schedule the
+    /// next one. `rng` is consulted only when jitter is enabled.
+    pub fn on_submitted(&mut self, now_ms: u64, rng: &mut Rng) {
+        self.issued = self.issued.saturating_add(1);
+        let ideal = self
+            .anchor_ms
+            .saturating_add(self.issued.saturating_mul(self.interval_ms));
+        // More than one whole interval behind: the time is GONE (a stall, a long
+        // back-off). Re-anchor on now and drop the backlog — never replay it.
+        let base = if ideal.saturating_add(self.interval_ms) < now_ms {
+            self.anchor_ms = now_ms;
+            self.issued = 0;
+            now_ms.saturating_add(self.interval_ms)
+        } else {
+            ideal
+        };
+        self.next_at_ms = self.jittered(base, rng);
+    }
+
+    /// Apply symmetric jitter of ±`jitter_pct`% of the interval around `base`.
+    fn jittered(&self, base: u64, rng: &mut Rng) -> u64 {
+        let span = self.interval_ms as u128 * self.jitter_pct as u128 / 100;
+        if span == 0 {
+            return base;
+        }
+        // Uniform in [base - span, base + span]: mean = base, so the cadence is
+        // unchanged. Saturating, so an early instant can never wrap.
+        let offset = rng.below(span * 2 + 1);
+        (base as u128)
+            .saturating_add(span)
+            .saturating_sub(offset)
+            .min(u64::MAX as u128) as u64
+    }
+}
+
+/// Which tip the heartbeat bids — the operator's choice of whether to exercise
+/// the blockspace auction at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TipChoice {
+    /// The suggested tip ([`SUGGESTED_TIP_GRAINS`]): exercises the auction and
+    /// lands promptly. The default.
+    Auto,
+    /// The operator's own fixed/range tip, so a bid can be placed deliberately at,
+    /// above or below the floor and the outcome watched.
+    Manual,
+    /// No tip at all: the bare action, no `Tipped` envelope. This deliberately
+    /// does NOT exercise the auction — and under contention such a transaction can
+    /// WAIT below the dynamic floor for a long time. That is legitimate behaviour
+    /// to demonstrate, and the UI says so rather than looking stalled.
+    NoTip,
+}
+
+impl TipChoice {
+    /// The words the UI shows for this choice.
+    pub fn label(self) -> &'static str {
+        match self {
+            TipChoice::Auto => "Auto tip",
+            TipChoice::Manual => "Manual tip",
+            TipChoice::NoTip => "No tip",
+        }
+    }
+
+    /// An honest one-line consequence of the choice.
+    pub fn consequence(self) -> &'static str {
+        match self {
+            TipChoice::Auto => {
+                "Bids the suggested tip (0.0005 XUS) — exercises the blockspace auction and lands \
+                 in the next block or two."
+            }
+            TipChoice::Manual => {
+                "Bids exactly what you configure in section 3 — set it above, at or below the \
+                 floor and watch what the auction does with it."
+            }
+            TipChoice::NoTip => {
+                "Bare action, no Tipped envelope: the auction is NOT exercised. Under contention \
+                 an untipped transaction can wait below the floor for a long time — submitted and \
+                 landed are reported separately so waiting never looks like a fault."
+            }
+        }
+    }
+}
+
+/// Resolve the heartbeat's [`TipMode`] from the operator's three-way choice and
+/// the manually configured tip.
+///
+/// This is only the BID. Whether it becomes an `Action::Tipped` envelope is
+/// decided later by [`transfer_action`] against the node's live `fee-auction`
+/// state, so no choice here can emit a tipped transaction on a chain where the
+/// fork is dormant.
+pub fn heartbeat_tip_mode(choice: TipChoice, manual: TipMode) -> TipMode {
+    match choice {
+        TipChoice::Auto => TipMode::Fixed(SUGGESTED_TIP_GRAINS),
+        TipChoice::Manual => manual,
+        TipChoice::NoTip => TipMode::Off,
+    }
+}
+
+/// The heartbeat's safety rails: what it may never spend past.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeartbeatLimits {
+    /// Balance the funding wallet must keep. The heartbeat PAUSES rather than
+    /// taking the balance below this — it never drains a wallet.
+    pub reserve_grains: u128,
+    /// Optional cap on transactions submitted this session (off by default).
+    pub max_tx: Option<u64>,
+    /// Optional cap on total spend (transfer + fee + tip) this session.
+    pub max_spend_grains: Option<u128>,
+}
+
+impl HeartbeatLimits {
+    /// Rails with only the balance reserve armed.
+    pub fn reserve_only(reserve_grains: u128) -> Self {
+        Self {
+            reserve_grains,
+            max_tx: None,
+            max_spend_grains: None,
+        }
+    }
+}
+
+/// Why the heartbeat is not sending right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeartbeatHalt {
+    /// The next send would take the balance below the operator's reserve.
+    /// Recoverable: PAUSE, keep watching (in closed-loop recycle the principal
+    /// comes back as the pending txs mine, and the heartbeat resumes by itself).
+    BalanceFloor {
+        /// The wallet's balance, in grains.
+        balance: u128,
+        /// The reserve it must not dip below, in grains.
+        reserve: u128,
+    },
+    /// The session transaction cap was reached — terminal.
+    TxCap(u64),
+    /// The session spend cap would be exceeded — terminal.
+    SpendCap(u128),
+}
+
+impl HeartbeatHalt {
+    /// Whether this halt ends the session (a cap) rather than pausing it (the
+    /// balance floor, which can free up again).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, HeartbeatHalt::TxCap(_) | HeartbeatHalt::SpendCap(_))
+    }
+
+    /// The operator-facing reason, in words.
+    pub fn message(&self) -> String {
+        match self {
+            HeartbeatHalt::BalanceFloor { balance, reserve } => format!(
+                "paused at the balance floor — {} XUS left, reserve is {} XUS",
+                fmt_xus(*balance),
+                fmt_xus(*reserve)
+            ),
+            HeartbeatHalt::TxCap(n) => {
+                format!(
+                    "session cap reached — {} transactions submitted",
+                    fmt_count(*n)
+                )
+            }
+            HeartbeatHalt::SpendCap(g) => {
+                format!("session spend cap reached — {} XUS spent", fmt_xus(*g))
+            }
+        }
+    }
+}
+
+/// Decide whether the heartbeat may submit its next transaction.
+///
+/// `balance` is the worker's latest view of the funding wallet (`None` = not yet
+/// known, which is NOT treated as empty — the node is the authority and the
+/// mempool would refuse an unaffordable tx anyway). `next_cost` is what the next
+/// send commits: transfer + fee + tip.
+///
+/// Checked in the order an operator would want them reported: the caps that end
+/// the session first, then the floor that pauses it.
+pub fn heartbeat_halt(
+    limits: &HeartbeatLimits,
+    balance: Option<u128>,
+    sent: u64,
+    spent: u128,
+    next_cost: u128,
+) -> Option<HeartbeatHalt> {
+    if let Some(max) = limits.max_tx {
+        if sent >= max {
+            return Some(HeartbeatHalt::TxCap(sent));
+        }
+    }
+    if let Some(max) = limits.max_spend_grains {
+        if spent.saturating_add(next_cost) > max {
+            return Some(HeartbeatHalt::SpendCap(spent));
+        }
+    }
+    if let Some(bal) = balance {
+        // The floor is a floor AFTER the send: never take the wallet below it.
+        if bal.saturating_sub(next_cost) < limits.reserve_grains {
+            return Some(HeartbeatHalt::BalanceFloor {
+                balance: bal,
+                reserve: limits.reserve_grains,
+            });
+        }
+    }
+    None
+}
+
+/// A count observed over `elapsed_secs`, expressed in transactions per block —
+/// the same unit the heartbeat's target is set in, so target and actual are
+/// directly comparable. `None` until enough time has passed for the figure to
+/// mean anything (a fraction of a block would read as wild noise).
+pub fn per_block_rate(count: u64, elapsed_secs: f64) -> Option<f64> {
+    if !elapsed_secs.is_finite() || elapsed_secs < BLOCK_SECS / 5.0 {
+        return None;
+    }
+    Some(count as f64 * BLOCK_SECS / elapsed_secs)
 }
 
 /// What kind of rejection the node returned for a submit. Buckets mirror the
@@ -640,6 +1034,26 @@ pub fn grains_to_xus(grains: u128) -> String {
         whole.to_string()
     } else {
         format!("{whole}.{}", format!("{frac:08}").trim_end_matches('0'))
+    }
+}
+
+/// Format grains as XUS for DISPLAY: thousands-separated whole part, trailing
+/// zeros trimmed, and never an empty string. This is the one formatter every
+/// on-screen XUS figure goes through, so a balance in the wallet table, a tile
+/// and a log line all read identically. [`grains_to_xus`] stays the plain
+/// machine-readable form (no separators) for anything copied or parsed back.
+pub fn fmt_xus(grains: u128) -> String {
+    // Built ON the plain form, so the two can never disagree about a value: the
+    // display version only groups the whole part.
+    let plain = grains_to_xus(grains);
+    let (whole, frac) = plain.split_once('.').unwrap_or((plain.as_str(), ""));
+    // u64 covers the whole 21M-XUS supply many times over; saturate rather than
+    // truncate silently if a caller ever hands us a nonsense value.
+    let whole = fmt_count(whole.parse::<u64>().unwrap_or(u64::MAX));
+    if frac.is_empty() {
+        whole
+    } else {
+        format!("{whole}.{frac}")
     }
 }
 
@@ -1832,5 +2246,324 @@ mod tests {
         assert_eq!(fmt_elapsed(3_599), "59m 59s");
         assert_eq!(fmt_elapsed(3_600), "1h 00m");
         assert_eq!(fmt_elapsed(7_980), "2h 13m");
+    }
+
+    #[test]
+    fn fmt_xus_is_grouped_trimmed_and_never_empty() {
+        assert_eq!(fmt_xus(0), "0");
+        assert_eq!(fmt_xus(100_000_000), "1");
+        assert_eq!(fmt_xus(21_000), "0.00021");
+        assert_eq!(fmt_xus(50_000), "0.0005");
+        assert_eq!(fmt_xus(1_234_500_000_000), "12,345");
+        assert_eq!(fmt_xus(1_234_500_000_001), "12,345.00000001");
+        // Same value, two renderings: machine-readable vs grouped for display.
+        assert_eq!(grains_to_xus(1_234_500_000_000), "12345");
+    }
+
+    // ---- Heartbeat: cadence ---------------------------------------------
+
+    #[test]
+    fn cadence_converts_human_terms_to_an_interval() {
+        // 2 tx per 150 s block = one every 75 s.
+        assert_eq!(Cadence::PerBlock(2.0).interval_ms(), Ok(75_000));
+        assert_eq!(Cadence::PerBlock(1.0).interval_ms(), Ok(150_000));
+        assert_eq!(Cadence::PerBlock(0.5).interval_ms(), Ok(300_000));
+        assert_eq!(Cadence::EverySecs(30.0).interval_ms(), Ok(30_000));
+        // Both framings describe the same cadence.
+        assert_eq!(
+            Cadence::PerBlock(2.0).interval_ms(),
+            Cadence::EverySecs(75.0).interval_ms()
+        );
+        // Out of band, in either framing, is a refusal with a reason — not a
+        // silently clamped firehose.
+        assert!(Cadence::PerBlock(100.0).interval_ms().is_err());
+        assert!(Cadence::EverySecs(1.0).interval_ms().is_err());
+        assert!(Cadence::EverySecs(7_200.0).interval_ms().is_err());
+        assert!(Cadence::PerBlock(0.0).interval_ms().is_err());
+        assert!(Cadence::PerBlock(f64::NAN).interval_ms().is_err());
+        assert!(Cadence::EverySecs(-5.0).interval_ms().is_err());
+        // The description carries BOTH human framings.
+        let d = Cadence::PerBlock(2.0).describe();
+        assert!(d.contains("2.00 tx/block"), "{d}");
+        assert!(d.contains("75 s"), "{d}");
+    }
+
+    /// Run a heartbeat against a scripted clock and return the instants at which
+    /// it actually submitted. `step_ms` is the polling granularity of the worker
+    /// loop; `stalls` inserts a jump of the given length at the given time.
+    fn beat_times(hb: &mut Heartbeat, rng: &mut Rng, until_ms: u64, step_ms: u64) -> Vec<u64> {
+        let mut fired = Vec::new();
+        let mut now = 0u64;
+        while now <= until_ms {
+            // Exactly the worker's inner loop: fire every due beat, then wait.
+            while hb.due(now) {
+                fired.push(now);
+                hb.on_submitted(now, rng);
+            }
+            now += step_ms;
+        }
+        fired
+    }
+
+    #[test]
+    fn heartbeat_holds_the_target_cadence_and_never_bunches() {
+        // One hour at one tx every 10 s, 20% jitter, polled 4× a second.
+        let mut hb = Heartbeat::new(10_000, HEARTBEAT_JITTER_PCT);
+        let mut rng = Rng::seeded(0xC0FFEE);
+        let fired = beat_times(&mut hb, &mut rng, 3_600_000, 250);
+        // 3,600 s / 10 s = 360 beats, ±1 for where the window ends.
+        assert!(
+            (359..=361).contains(&fired.len()),
+            "expected ~360 beats, got {}",
+            fired.len()
+        );
+
+        let gaps: Vec<u64> = fired.windows(2).map(|w| w[1] - w[0]).collect();
+        // No bunching: jitter is ±20%, so consecutive beats can differ by at most
+        // 40% of the interval — nothing may ever land back-to-back.
+        let min = *gaps.iter().min().unwrap();
+        let max = *gaps.iter().max().unwrap();
+        assert!(min >= 5_500, "beats bunched: min gap {min} ms");
+        assert!(max <= 14_500, "beat starved: max gap {max} ms");
+        // And the MEAN is the target: jitter changes texture, not rate.
+        let mean = gaps.iter().sum::<u64>() as f64 / gaps.len() as f64;
+        assert!((mean - 10_000.0).abs() < 250.0, "mean gap {mean} ms");
+        // Jitter is real (a metronome would show one single gap value).
+        assert!(gaps.iter().collect::<std::collections::HashSet<_>>().len() > 10);
+    }
+
+    #[test]
+    fn heartbeat_without_jitter_is_exact() {
+        let mut hb = Heartbeat::new(10_000, 0);
+        let mut rng = Rng::seeded(7);
+        let fired = beat_times(&mut hb, &mut rng, 100_000, 250);
+        assert_eq!(
+            fired,
+            vec![
+                0, 10_000, 20_000, 30_000, 40_000, 50_000, 60_000, 70_000, 80_000, 90_000, 100_000
+            ]
+        );
+        assert_eq!(hb.interval_ms(), 10_000);
+    }
+
+    #[test]
+    fn heartbeat_makes_up_a_small_deficit_without_drifting() {
+        // The submission was late (slow RPC): the NEXT beat stays on the ideal
+        // schedule instead of drifting the whole stream later.
+        let mut hb = Heartbeat::new(10_000, 0);
+        let mut rng = Rng::seeded(1);
+        assert!(hb.due(0));
+        hb.on_submitted(0, &mut rng);
+        assert_eq!(hb.wait_ms(0), 10_000);
+        // Beat #2 goes out 3 s late…
+        assert!(hb.due(13_000));
+        hb.on_submitted(13_000, &mut rng);
+        // …and beat #3 is still due at the ideal 20 s, not at 23 s. Exactly ONE
+        // beat is due at a time — the deficit never becomes a burst.
+        assert!(!hb.due(13_000));
+        assert_eq!(hb.wait_ms(13_000), 7_000);
+        assert!(hb.due(20_000));
+    }
+
+    #[test]
+    fn heartbeat_drops_a_long_stall_instead_of_replaying_it() {
+        // The node was unreachable for three minutes. Those beats are GONE: the
+        // heartbeat re-anchors on now, it does not fire 18 transactions at once.
+        let mut hb = Heartbeat::new(10_000, 0);
+        let mut rng = Rng::seeded(2);
+        hb.on_submitted(0, &mut rng);
+        let mut fired = 0;
+        let now = 200_000;
+        while hb.due(now) {
+            fired += 1;
+            hb.on_submitted(now, &mut rng);
+            assert!(fired < 5, "the heartbeat replayed a stalled backlog");
+        }
+        assert_eq!(fired, 1);
+        assert_eq!(hb.wait_ms(now), 10_000);
+        // And it is back on a clean cadence from here.
+        let fired_after = beat_times(&mut Heartbeat::new(10_000, 0), &mut rng, 30_000, 250);
+        assert_eq!(fired_after.len(), 4);
+    }
+
+    // ---- Heartbeat: safety rails ----------------------------------------
+
+    #[test]
+    fn heartbeat_pauses_at_the_balance_floor_and_resumes_when_funded() {
+        let limits = HeartbeatLimits::reserve_only(100_000_000); // reserve 1 XUS
+        let cost = 121_000; // 0.001 XUS + fee + tip
+                            // Comfortably above the floor: send.
+        assert_eq!(heartbeat_halt(&limits, Some(500_000_000), 0, 0, cost), None);
+        // The send WOULD dip under the reserve: pause, do not drain.
+        let halt = heartbeat_halt(&limits, Some(100_050_000), 42, 5_000_000, cost)
+            .expect("must refuse to cross the floor");
+        assert_eq!(
+            halt,
+            HeartbeatHalt::BalanceFloor {
+                balance: 100_050_000,
+                reserve: 100_000_000
+            }
+        );
+        assert!(
+            !halt.is_terminal(),
+            "the floor pauses, it does not end the run"
+        );
+        assert!(halt.message().contains("balance floor"));
+        // Exactly at the boundary (balance - cost == reserve) is still allowed.
+        assert_eq!(
+            heartbeat_halt(&limits, Some(100_000_000 + cost), 1, 0, cost),
+            None
+        );
+        // One grain short is not.
+        assert!(heartbeat_halt(&limits, Some(100_000_000 + cost - 1), 1, 0, cost).is_some());
+        // Balance the worker has not read yet is UNKNOWN, not empty: the node's
+        // mempool remains the authority and the heartbeat keeps going.
+        assert_eq!(heartbeat_halt(&limits, None, 1, 0, cost), None);
+        // Refunded (closed-loop recycle returns the principal): resumes by itself.
+        assert_eq!(
+            heartbeat_halt(&limits, Some(900_000_000), 42, 5_000_000, cost),
+            None
+        );
+    }
+
+    #[test]
+    fn heartbeat_caps_are_off_by_default_and_terminal_when_set() {
+        // Default rails: only the floor. A million transactions later, still fine.
+        let open = HeartbeatLimits::reserve_only(0);
+        assert_eq!(
+            heartbeat_halt(&open, Some(u128::MAX), 1_000_000, u128::MAX / 2, 121_000),
+            None
+        );
+
+        let capped = HeartbeatLimits {
+            reserve_grains: 0,
+            max_tx: Some(10),
+            max_spend_grains: Some(1_000_000),
+        };
+        // Under the count cap: allowed.
+        assert_eq!(heartbeat_halt(&capped, Some(u128::MAX), 9, 0, 1), None);
+        // At the cap: stop, terminally.
+        let halt = heartbeat_halt(&capped, Some(u128::MAX), 10, 0, 1).unwrap();
+        assert_eq!(halt, HeartbeatHalt::TxCap(10));
+        assert!(halt.is_terminal());
+        // Spend cap bites BEFORE the spend happens, not after.
+        assert_eq!(
+            heartbeat_halt(&capped, Some(u128::MAX), 0, 900_000, 100_000),
+            None
+        );
+        let halt = heartbeat_halt(&capped, Some(u128::MAX), 0, 900_001, 100_000).unwrap();
+        assert_eq!(halt, HeartbeatHalt::SpendCap(900_001));
+        assert!(halt.is_terminal());
+        // Caps are checked ahead of the floor, so the reported reason is the one
+        // that actually ended the session.
+        let both = HeartbeatLimits {
+            reserve_grains: u128::MAX,
+            max_tx: Some(1),
+            max_spend_grains: None,
+        };
+        assert_eq!(
+            heartbeat_halt(&both, Some(0), 1, 0, 1),
+            Some(HeartbeatHalt::TxCap(1))
+        );
+    }
+
+    // ---- Heartbeat: the fee-auction three-way ---------------------------
+
+    #[test]
+    fn heartbeat_tip_choice_resolves_the_bid() {
+        let manual = TipMode::Range {
+            min: 1_000,
+            max: 2_000,
+        };
+        assert_eq!(
+            heartbeat_tip_mode(TipChoice::Auto, manual),
+            TipMode::Fixed(SUGGESTED_TIP_GRAINS)
+        );
+        assert_eq!(heartbeat_tip_mode(TipChoice::Manual, manual), manual);
+        assert_eq!(heartbeat_tip_mode(TipChoice::NoTip, manual), TipMode::Off);
+    }
+
+    #[test]
+    fn no_tip_emits_the_bare_action_and_auto_tip_emits_the_envelope() {
+        let mut rng = Rng::seeded(9);
+        let to = acct("alice.sov");
+
+        // Auto: a real bid, wrapped for the live auction.
+        let tip = heartbeat_tip_mode(TipChoice::Auto, TipMode::Off).pick(&mut rng);
+        assert_eq!(tip, SUGGESTED_TIP_GRAINS);
+        match transfer_action(to.clone(), 1_000, tip, /* auction_active = */ true) {
+            Action::Tipped { tip, inner } => {
+                assert_eq!(tip.grains(), SUGGESTED_TIP_GRAINS);
+                assert!(matches!(*inner, Action::Transfer { .. }));
+            }
+            other => panic!("auto tip must bid in the auction, got {other:?}"),
+        }
+
+        // No tip: the bare action even though the auction IS active — this is the
+        // choice that deliberately does not exercise it.
+        let tip = heartbeat_tip_mode(TipChoice::NoTip, TipMode::Fixed(9_999)).pick(&mut rng);
+        assert_eq!(tip, 0);
+        assert!(matches!(
+            transfer_action(to.clone(), 1_000, tip, true),
+            Action::Transfer { .. }
+        ));
+
+        // Dormant fork: byte-identical bare action whatever the operator chose —
+        // the toggle can never emit an envelope a dormant chain would reject.
+        for choice in [TipChoice::Auto, TipChoice::Manual, TipChoice::NoTip] {
+            let tip = heartbeat_tip_mode(choice, TipMode::Fixed(9_999)).pick(&mut rng);
+            assert!(
+                matches!(
+                    transfer_action(to.clone(), 1_000, tip, /* auction_active = */ false),
+                    Action::Transfer { .. }
+                ),
+                "{choice:?} emitted a tipped action on a dormant chain"
+            );
+        }
+    }
+
+    // ---- Heartbeat: surviving the long haul ------------------------------
+
+    #[test]
+    fn heartbeat_resyncs_its_nonce_after_an_error_gap_without_wedging() {
+        // The long-haul failure mode: the node goes away mid-stream (transport
+        // errors, which are NOT proof the slot was consumed), then comes back with
+        // the account moved on because our earlier txs mined. The heartbeat must
+        // hold its nonce through the gap, resync forward, and keep going — never
+        // reuse a committed nonce and never wedge on a burnt one.
+        let mut seq = NonceSequencer::new();
+        seq.reconcile(40);
+        let submitted = drive(
+            &mut seq,
+            &[
+                Sim::Accept,                             // 40 pooled
+                Sim::Accept,                             // 41 pooled
+                Sim::Reject(RejectClass::Other),         // 42: node unreachable → hold
+                Sim::Reject(RejectClass::Other),         // 42 again → still held
+                Sim::StaleWithNodeNonce(42),             // back up: 40+41 mined, next is 42
+                Sim::Accept,                             // 42 pooled
+                Sim::Reject(RejectClass::NonceOccupied), // 43 was our own retry
+                Sim::Accept,                             // 44 pooled
+            ],
+        );
+        assert_eq!(submitted, vec![40, 41, 42, 42, 42, 42, 43, 44]);
+        let mut committed = submitted.clone();
+        committed.dedup();
+        assert_eq!(committed, vec![40, 41, 42, 43, 44]); // gap-free, nothing reused
+        assert_eq!(seq.peek(), 45);
+    }
+
+    #[test]
+    fn per_block_rate_reports_the_actual_landed_cadence() {
+        // 12 transactions over six 150 s blocks = 2 per block.
+        assert_eq!(per_block_rate(12, 900.0), Some(2.0));
+        assert_eq!(per_block_rate(0, 900.0), Some(0.0)); // landed nothing IS the answer
+                                                         // Too early to say: a fraction of a block is noise, not a rate.
+        assert_eq!(per_block_rate(1, 10.0), None);
+        assert_eq!(per_block_rate(1, f64::NAN), None);
+        // A no-tip heartbeat submitting 4/block but landing 1/block reports both
+        // honestly — the pacer holds submissions, the landed figure tells the truth.
+        assert_eq!(per_block_rate(24, 900.0), Some(4.0));
+        assert_eq!(per_block_rate(6, 900.0), Some(1.0));
     }
 }

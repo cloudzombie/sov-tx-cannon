@@ -31,13 +31,15 @@ repository boundary is stated in [AGENTS.md](AGENTS.md).
   is **no reimplemented crypto, keystore, id, or codec logic in this crate** —
   that is the single most important property of this tool and it is enforced by
   the dependency pin, not by convention.
-- **Three rate modes.**
+- **Four rate modes.**
   - *Per block* — fire N transactions on each new chain tip.
   - *Target TX/s* — a paced, block-independent rate (cumulative-due scheduler
     with bounded catch-up).
   - *Firehose* — submit as fast as sign-and-POST allows; mempool capacity
     rejections are the only brake, and the cannon holds and retries the **same**
     nonce on those, self-pacing to the node's drain rate.
+  - *Heartbeat* — a gentle, indefinite trickle that keeps blocks non-empty, with
+    safety rails; see [Heartbeat mode](#heartbeat-mode).
 - **Blockspace-auction tips.** Optionally attach a priority tip to each
   transaction (SOV v0.1.98 `Action::Tipped`), fixed or drawn from a range so a
   fleet spreads a realistic spectrum of bids across the dynamic fee floor. The
@@ -59,6 +61,56 @@ repository boundary is stated in [AGENTS.md](AGENTS.md).
 It only READS chain state and SUBMITS already-signed transactions over the same
 key-free RPC surface any wallet uses. It touches no consensus, mining,
 block-encoding, or genesis code.
+
+### Heartbeat mode
+
+Heartbeat is the *constant stream* mode: chain liveness rather than load. It runs
+**until you stop it**.
+
+- **Cadence in human terms.** Set it as "N transactions per block" (the mainnet
+  target block time, 150 s, is the reference) or "one every N seconds" — the two
+  framings are the same interval and the UI shows both. The default is a gentle
+  2 tx/block (one every 75 s). The band is one tx every 5 s at the fastest and one
+  an hour at the slowest; anything faster is a job for *Target TX/s*.
+- **Self-pacing, not sleeping.** It holds an *ideal* schedule (`anchor +
+  issued × interval`), so signing time, RPC latency and back-offs cannot make the
+  cadence drift. A single late submission is followed by one that is due
+  immediately, so the deficit it will make up is bounded by one interval — it can
+  never bunch. If it falls more than one interval behind (an outage, a long
+  back-off) it re-anchors on *now* and **drops** the backlog instead of replaying
+  it as a burst.
+- **Organic, not robotic.** The interval is jittered ±20% around each scheduled
+  instant (mean cadence unchanged), and destination/amount reuse the existing
+  random-dest and range-amount modes. Amounts default to dust.
+- **Built for the long haul.** An unreachable node is a back-off, never an exit;
+  every recovery re-reads the account nonce and reconciles forward, so a gap can
+  never leave a stuck or reused nonce.
+- **Does it exercise the fee auction? Your choice.**
+  - *Auto tip* (default) — bids the suggested 0.0005 XUS, so the transaction
+    competes in the blockspace auction and lands promptly.
+  - *Manual tip* — bids exactly the fixed value or range configured under
+    *3 · traffic*, so a bid can be placed deliberately at, above or below the
+    floor and the outcome watched.
+  - *No tip* — the bare action, no `Tipped` envelope: the auction is deliberately
+    **not** exercised, and with the auction active such a transaction can wait
+    below the dynamic floor for a long time. The heartbeat paces *submissions* in
+    that case and reports **submitted, landed and pooled separately**, so waiting
+    reads as the auction working rather than as a stalled cannon.
+  Whatever is chosen, the existing dormant-fork gate still applies: if the node
+  does not report `fee-auction` `Active`, no envelope is attached and the
+  transaction is byte-identical to an untipped one.
+- **Safety rails, always on.**
+  - *Balance floor* (default 1 XUS): the heartbeat **pauses** rather than taking a
+    wallet below the reserve, says so on screen, and resumes by itself if the
+    balance recovers — in closed-loop recycle it does, as the principal mines back.
+  - *Optional session caps* on transaction count and total spend, both **off** by
+    default. A cap ends the run with the reason on screen (not as a fault).
+  - The rails are checked against the **worst case** next transaction (largest
+    amount in range + fee + largest bid), so a range amount can never be what
+    crosses the reserve.
+- **Landed means mined.** The "landed" figure comes from the node's own account
+  nonce, not from mempool acceptance, so it is the honest count of transactions the
+  chain actually included.
 
 ### Closed-loop recycle mode
 
@@ -199,10 +251,29 @@ companion `.sha256` checksum, both attached to the GitHub Release for the tag.
 The macOS job runs `cargo test --locked` on the arm64 runner before packaging,
 so a published binary is one that passed its tests natively on Apple Silicon.
 
+### 0.2.1
+
+- **Heartbeat (constant stream) mode** — a gentle, indefinite trickle that keeps
+  blocks non-empty, self-paced against an ideal schedule (no drift, no bunching, a
+  stall dropped rather than replayed), jittered, with a balance floor and optional
+  session caps. See [Heartbeat mode](#heartbeat-mode).
+- **Three-way fee-auction option for the heartbeat** — auto/suggested tip
+  (default), operator-set fixed or range tip, or no tip at all (bare action, the
+  auction deliberately not exercised). Submitted / landed / pooled are reported
+  separately so an untipped transaction waiting below the floor reads honestly.
+  The dormant-fork gate is unchanged: no envelope is ever attached on a chain that
+  has not activated `fee-auction`.
+- **UI polish pass** — one shared XUS formatter for every on-screen figure, stat
+  tiles with their units on the figure's baseline (no staggered band), distinct
+  glyph/word/hue for every operator state (including the new HEARTBEAT and PAUSED),
+  landed/pooled columns in the wallet table, a *ready to fire* briefing in place of
+  an empty meter panel, tooltips on the mode and arming controls, and a Start
+  button that is disabled only with a stated reason.
+
 To cut a release:
 
 1. Bump `version` in `Cargo.toml`, refresh `Cargo.lock` (`cargo update -p sov-tx-cannon`), and merge that through a PR.
-2. Push a matching tag: `git tag v0.2.0 && git push origin v0.2.0`.
+2. Push a matching tag: `git tag v0.2.1 && git push origin v0.2.1`.
 3. The release workflow builds, tests on arm64, packages, and publishes the
    assets. Do not create tags for unreleased or mismatched versions.
 

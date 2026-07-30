@@ -45,10 +45,12 @@ use sov_rpc::{Keystore, RpcClient};
 
 use logic::{
     build_signed_transfer, classify_reject, derive_account_id, disposition, first_blocker,
-    fmt_count, fmt_elapsed, fmt_pct, fmt_rate, grains_to_xus, nice_ceiling,
-    parse_fee_auction_active, parse_xus, scope_x, scope_x_age, scope_y, share, AmountMode,
-    DestMode, DestSelector, Disposition, KeyScheme, MeterKind, NonceSequencer, Pacer, Pressure,
-    RateMeter, RateMode, RejectClass, Rng, TipMode, SCOPE_GAP_MS, SCOPE_WINDOW_SECS,
+    fmt_count, fmt_elapsed, fmt_pct, fmt_rate, fmt_secs, fmt_xus, heartbeat_halt,
+    heartbeat_tip_mode, nice_ceiling, parse_fee_auction_active, parse_xus, per_block_rate, scope_x,
+    scope_x_age, scope_y, share, AmountMode, Cadence, DestMode, DestSelector, Disposition,
+    Heartbeat, HeartbeatLimits, KeyScheme, MeterKind, NonceSequencer, Pacer, Pressure, RateMeter,
+    RateMode, RejectClass, Rng, TipChoice, TipMode, BLOCK_SECS, HEARTBEAT_JITTER_PCT, SCOPE_GAP_MS,
+    SCOPE_WINDOW_SECS, SUGGESTED_TIP_GRAINS,
 };
 use redteam::ProbeReport;
 
@@ -79,6 +81,20 @@ const OTHER_BACKOFF: Duration = Duration::from_millis(500);
 /// -after-Stop state): long enough not to spam the node, short enough to resume
 /// within a few seconds of the backlog mining out.
 const AFFORD_BACKOFF: Duration = Duration::from_secs(4);
+/// How often a HEARTBEAT worker reconciles nonce + balance + fork state with the
+/// node. Longer than the continuous modes' [`RECONCILE_INTERVAL`] because the
+/// heartbeat is meant to run for weeks and must not itself become node load —
+/// still well under one block, so a beat never sends on a stale nonce.
+const HEARTBEAT_SYNC_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a heartbeat waits before retrying an unreachable node. Gentler than
+/// the other modes' [`POLL_INTERVAL`]: a heartbeat may be running for weeks, and
+/// hammering a node that is down is not how it should behave. The beat it misses
+/// is dropped, not replayed, so nothing accumulates while it waits.
+const HEARTBEAT_RETRY_BACKOFF: Duration = Duration::from_secs(3);
+/// How long a heartbeat waits before re-examining a safety-rail PAUSE (balance
+/// floor). Long enough not to poll the node hard while parked, short enough to
+/// resume within a block of the balance recovering.
+const HEARTBEAT_PAUSE_BACKOFF: Duration = Duration::from_secs(15);
 /// The node's default mempool capacity (display hint for the saturation flag;
 /// the node remains the authority — its "mempool is full" rejections are what
 /// actually gate submission).
@@ -93,6 +109,9 @@ const METER_WINDOW_SECS: u64 = 5;
 const MEMPOOL_HISTORY_SAMPLES: usize = SCOPE_WINDOW_SECS as usize + 8;
 /// Below this window width the two-column layout folds into one column.
 const WIDE_LAYOUT_MIN: f32 = 1_020.0;
+/// Common height for every segmented-control button in the control bar, so the
+/// mode, cadence-framing and arming groups sit on one unbroken line.
+const MODE_BTN_H: f32 = 28.0;
 
 /// One observation of the node's mempool at a point in time.
 ///
@@ -320,6 +339,18 @@ struct WalletStat {
     fault: Option<String>,
     /// Set while this wallet is waiting rather than firing (back-off reason).
     waiting: Option<String>,
+    /// The account nonce the NODE reports — i.e. how far this wallet's txs have
+    /// actually been MINED, as opposed to submitted. `None` until first read.
+    node_nonce: Option<u64>,
+    /// The node's nonce when the run began; the baseline for "landed this run".
+    first_node_nonce: Option<u64>,
+    /// Transactions this worker has submitted (or dry-run built) this run.
+    sent: u64,
+    /// What those submissions committed: transfer + fee + tip, in grains.
+    spent_grains: u128,
+    /// Set when this wallet finished for a NORMAL configured reason (a heartbeat
+    /// session cap) — distinct from `fault`, which means something went wrong.
+    done_reason: Option<String>,
 }
 
 impl WalletStat {
@@ -327,6 +358,22 @@ impl WalletStat {
     /// baseline is still unknown.
     fn committed(&self) -> Option<u64> {
         self.first_nonce.map(|f| self.next_nonce.saturating_sub(f))
+    }
+
+    /// Transactions of ours the chain has MINED this run, read from the node's own
+    /// account nonce — the honest "landed" figure. An untipped heartbeat waiting
+    /// below the fee floor shows submissions without landings, which is the truth
+    /// rather than a fault. `None` until the baseline is known.
+    fn landed(&self) -> Option<u64> {
+        match (self.first_node_nonce, self.node_nonce) {
+            (Some(first), Some(now)) => Some(now.saturating_sub(first)),
+            _ => None,
+        }
+    }
+
+    /// Our transactions sitting in the mempool: submitted but not yet mined.
+    fn pending(&self) -> Option<u64> {
+        self.node_nonce.map(|n| self.next_nonce.saturating_sub(n))
     }
 }
 
@@ -345,6 +392,27 @@ struct Status {
     last_error: String,
     /// Newest-last per-tx log (bounded).
     log: Vec<LogLine>,
+    /// Set for the whole life of a HEARTBEAT run: what cadence and bid it was
+    /// armed with. Frozen at start, so the live readout compares against what is
+    /// actually running rather than against whatever the form now says.
+    heartbeat: Option<HeartbeatView>,
+}
+
+/// The heartbeat parameters a run was started with (frozen at Start).
+#[derive(Clone, Copy)]
+struct HeartbeatView {
+    /// AGGREGATE target interval across all firing wallets, in milliseconds.
+    interval_ms: u64,
+    jitter_pct: u32,
+    tip: TipChoice,
+    limits: HeartbeatLimits,
+}
+
+impl HeartbeatView {
+    /// The aggregate target cadence, in transactions per block.
+    fn target_per_block(&self) -> f64 {
+        BLOCK_SECS * 1_000.0 / self.interval_ms as f64
+    }
 }
 
 impl Default for Status {
@@ -357,6 +425,7 @@ impl Default for Status {
             live_workers: 0,
             last_error: String::new(),
             log: Vec::new(),
+            heartbeat: None,
         }
     }
 }
@@ -445,9 +514,13 @@ struct WorkerConfig {
     /// the node reports the `fee-auction` deployment Active (see
     /// [`WorkerState::auction_active`]); dormant, the worker emits the bare action.
     tip_mode: TipMode,
-    /// The rate mode with any per-worker share already applied (Target TX/s is
-    /// split across the selected wallets).
+    /// The rate mode with any per-worker share already applied (Target TX/s and
+    /// the heartbeat cadence are split across the selected wallets).
     mode: RateMode,
+    /// The heartbeat's safety rails, with the session caps already divided across
+    /// the selected wallets so the AGGREGATE cap is what the operator typed. Only
+    /// consulted by [`run_heartbeat`]; the other modes ignore it.
+    limits: HeartbeatLimits,
     dry_run: bool,
 }
 
@@ -475,6 +548,8 @@ enum ModeChoice {
     PerBlock,
     TargetTps,
     Firehose,
+    /// The constant, indefinite trickle — chain liveness, not load.
+    Heartbeat,
 }
 
 /// The application state.
@@ -507,6 +582,22 @@ struct CannonApp {
     mode: ModeChoice,
     rate: String,
     tps: String,
+    // ---- Heartbeat (constant stream) ----
+    /// Cadence framing: `true` = "N tx per block", `false` = "one every N s".
+    hb_per_block: bool,
+    hb_tx_per_block: String,
+    hb_every_secs: String,
+    /// Jitter the interval so the stream is organic rather than a metronome.
+    hb_jitter: bool,
+    /// Whether — and how — the heartbeat exercises the blockspace fee auction.
+    hb_tip: TipChoice,
+    /// Balance the funding wallets must keep (XUS). Never drained past this.
+    hb_reserve: String,
+    /// Optional session caps, both off by default.
+    hb_cap_tx_on: bool,
+    hb_cap_tx: String,
+    hb_cap_spend_on: bool,
+    hb_cap_spend: String,
     dry_run: bool,
     config_msg: String,
 
@@ -548,6 +639,28 @@ struct CannonApp {
     adv_confirm: String,
 }
 
+/// A frame-local snapshot of the live heartbeat, aggregated across wallets. Every
+/// field is either a real counter or an explicit `None` — nothing is inferred.
+struct HeartbeatSummary {
+    target_per_block: f64,
+    /// SUBMISSION cadence actually achieved (`None` until a meaningful sample).
+    actual_per_block: Option<f64>,
+    /// Cadence actually MINED — lower than submitted whenever transactions are
+    /// waiting in the pool (which an untipped heartbeat expects).
+    landed_per_block: Option<f64>,
+    sent: u64,
+    landed: Option<u64>,
+    pending: Option<u64>,
+    spent_grains: u128,
+    elapsed_secs: u64,
+    interval_ms: u64,
+    jitter_pct: u32,
+    tip: TipChoice,
+    limits: HeartbeatLimits,
+    /// Why it is not sending right now, if it is not.
+    paused: Option<String>,
+}
+
 /// What a finished run did — kept so "stopped" is a result, not a blank screen.
 #[derive(Clone)]
 struct RunSummary {
@@ -581,6 +694,18 @@ impl Default for CannonApp {
             mode: ModeChoice::PerBlock,
             rate: "1".to_string(),
             tps: "2".to_string(),
+            // Gentle and sustainable by default: two transactions per ~2.5-minute
+            // block (one every 75 s), jittered, tipped at the suggested bid.
+            hb_per_block: true,
+            hb_tx_per_block: "2".to_string(),
+            hb_every_secs: "75".to_string(),
+            hb_jitter: true,
+            hb_tip: TipChoice::Auto,
+            hb_reserve: "1".to_string(),
+            hb_cap_tx_on: false,
+            hb_cap_tx: "1000".to_string(),
+            hb_cap_spend_on: false,
+            hb_cap_spend: "1".to_string(),
             dry_run: true,
             config_msg: String::new(),
             status: Arc::new(Mutex::new(Status::default())),
@@ -769,6 +894,60 @@ impl CannonApp {
         Ok(mode)
     }
 
+    /// The heartbeat cadence the operator typed, in whichever framing is selected.
+    fn parse_cadence(&self) -> Result<Cadence, String> {
+        if self.hb_per_block {
+            let n = self
+                .hb_tx_per_block
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| "transactions per block is not a number".to_string())?;
+            Ok(Cadence::PerBlock(n))
+        } else {
+            let s = self
+                .hb_every_secs
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| "the interval is not a number of seconds".to_string())?;
+            Ok(Cadence::EverySecs(s))
+        }
+    }
+
+    /// The heartbeat's safety rails as the operator set them (AGGREGATE, before
+    /// they are divided across workers).
+    fn parse_limits(&self) -> Result<HeartbeatLimits, String> {
+        let reserve_grains =
+            parse_xus(&self.hb_reserve).ok_or("the balance reserve is not a valid XUS value")?;
+        let max_tx = if self.hb_cap_tx_on {
+            let n = self
+                .hb_cap_tx
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| "the transaction cap is not a whole number".to_string())?;
+            if n == 0 {
+                return Err("the transaction cap must be at least 1".into());
+            }
+            Some(n)
+        } else {
+            None
+        };
+        let max_spend_grains = if self.hb_cap_spend_on {
+            let g =
+                parse_xus(&self.hb_cap_spend).ok_or("the spend cap is not a valid XUS value")?;
+            if g == 0 {
+                return Err("the spend cap must be greater than zero".into());
+            }
+            Some(g)
+        } else {
+            None
+        };
+        Ok(HeartbeatLimits {
+            reserve_grains,
+            max_tx,
+            max_spend_grains,
+        })
+    }
+
     /// Parse + validate the tip mode from the UI fields. `TipMode::Off` when tips
     /// are toggled off — the cannon then behaves exactly as it did before tips
     /// existed. Amounts are read in XUS and stored as grains, like transfer amounts.
@@ -776,6 +955,13 @@ impl CannonApp {
         if !self.tip_on {
             return Ok(TipMode::Off);
         }
+        self.parse_tip_fields()
+    }
+
+    /// The tip the fixed/range fields describe, whatever the "attach tip" switch
+    /// says. The heartbeat's MANUAL choice is itself the switch, so it reads the
+    /// fields directly rather than requiring both toggles to agree.
+    fn parse_tip_fields(&self) -> Result<TipMode, String> {
         let mode = if self.tip_random {
             let min = parse_xus(&self.tip_min).ok_or("tip min is not a valid XUS value")?;
             let max = parse_xus(&self.tip_max).ok_or("tip max is not a valid XUS value")?;
@@ -804,6 +990,30 @@ impl CannonApp {
                 _ => Err(format!("target TX/s must be between 0.1 and {MAX_TPS}")),
             },
             ModeChoice::Firehose => Ok(RateMode::Firehose),
+            // The cadence the operator types is the AGGREGATE stream; each wallet
+            // beats that many times slower so N wallets together hold the target.
+            ModeChoice::Heartbeat => {
+                let interval = self.parse_cadence()?.interval_ms()?;
+                Ok(RateMode::Heartbeat {
+                    interval_ms: interval.saturating_mul(n_workers.max(1) as u64),
+                    jitter_pct: if self.hb_jitter {
+                        HEARTBEAT_JITTER_PCT
+                    } else {
+                        0
+                    },
+                })
+            }
+        }
+    }
+
+    /// The tip bid for the current mode: the heartbeat's three-way choice (auto /
+    /// manual / none) resolves through [`heartbeat_tip_mode`]; every other mode
+    /// uses section 3's tip switch exactly as before.
+    fn effective_tip_mode(&self) -> Result<TipMode, String> {
+        if self.mode == ModeChoice::Heartbeat {
+            Ok(heartbeat_tip_mode(self.hb_tip, self.parse_tip_fields()?))
+        } else {
+            self.parse_tip_mode()
         }
     }
 
@@ -839,7 +1049,7 @@ impl CannonApp {
                 return None;
             }
         };
-        let tip_mode = match self.parse_tip_mode() {
+        let tip_mode = match self.effective_tip_mode() {
             Ok(m) => m,
             Err(e) => {
                 self.config_msg = e;
@@ -852,6 +1062,30 @@ impl CannonApp {
                 self.config_msg = e;
                 return None;
             }
+        };
+        // Safety rails. Only the heartbeat consults them, but parse them whenever
+        // it is the selected mode so a bad reserve is refused at Start, not later.
+        let aggregate_limits = if self.mode == ModeChoice::Heartbeat {
+            match self.parse_limits() {
+                Ok(l) => l,
+                Err(e) => {
+                    self.config_msg = e;
+                    return None;
+                }
+            }
+        } else {
+            HeartbeatLimits::reserve_only(0)
+        };
+        // Per-worker rails: the reserve is per WALLET (each must keep it), while the
+        // session caps are aggregate and divided, so N wallets together spend at
+        // most what the operator typed.
+        let workers = selected.len().max(1) as u128;
+        let limits = HeartbeatLimits {
+            reserve_grains: aggregate_limits.reserve_grains,
+            max_tx: aggregate_limits.max_tx.map(|n| (n / workers as u64).max(1)),
+            max_spend_grains: aggregate_limits
+                .max_spend_grains
+                .map(|g| (g / workers).max(1)),
         };
         let dest_mode = if self.dest_random {
             DestMode::Random
@@ -877,6 +1111,7 @@ impl CannonApp {
                     amount_mode,
                     tip_mode,
                     mode,
+                    limits,
                     dry_run: self.dry_run,
                 }
             })
@@ -893,6 +1128,24 @@ impl CannonApp {
         let Some(configs) = self.build_worker_configs() else {
             return;
         };
+        // Freeze the heartbeat parameters this run is armed with, so the live
+        // readout always compares against what is actually beating.
+        let heartbeat = match configs.first().map(|c| (c.mode, c.limits)) {
+            Some((
+                RateMode::Heartbeat {
+                    interval_ms,
+                    jitter_pct,
+                },
+                limits,
+            )) => Some(HeartbeatView {
+                // Per-worker interval ÷ workers = the aggregate cadence.
+                interval_ms: (interval_ms / configs.len().max(1) as u64).max(1),
+                jitter_pct,
+                tip: self.hb_tip,
+                limits,
+            }),
+            _ => None,
+        };
         // Reset counters + per-wallet stats for the new run.
         {
             let mut st = self.status.lock().unwrap();
@@ -906,6 +1159,7 @@ impl CannonApp {
                         ..WalletStat::default()
                     })
                     .collect(),
+                heartbeat,
                 ..Status::default()
             };
         }
@@ -986,6 +1240,23 @@ impl CannonApp {
         }));
     }
 
+    /// The first form value that will not parse into something the cannon can
+    /// fire, in the order the operator would fix them. `None` means every field is
+    /// usable — so Start being disabled always has a reason on screen.
+    fn arming_error(&self) -> Option<String> {
+        self.parse_amount_mode()
+            .err()
+            .or_else(|| self.effective_tip_mode().err())
+            .or_else(|| self.parse_rate_mode(self.selected_count().max(1)).err())
+            .or_else(|| {
+                if self.mode == ModeChoice::Heartbeat {
+                    self.parse_limits().err()
+                } else {
+                    None
+                }
+            })
+    }
+
     /// One-line description of the configured rate mode and its parameter,
     /// exactly as it will be (or was) applied.
     fn mode_summary(&self) -> String {
@@ -993,7 +1264,24 @@ impl CannonApp {
             ModeChoice::PerBlock => format!("per block × {}", self.rate.trim()),
             ModeChoice::TargetTps => format!("paced {} TX/s", self.tps.trim()),
             ModeChoice::Firehose => "firehose".into(),
+            ModeChoice::Heartbeat => match self.parse_cadence().map(|c| c.describe()) {
+                Ok(d) => format!("heartbeat — {d}"),
+                Err(e) => format!("heartbeat — {e}"),
+            },
         }
+    }
+
+    /// The live heartbeat readout, aggregated across every firing wallet, or
+    /// `None` when the current run is not a heartbeat.
+    ///
+    /// Every figure is a real counter: `sent` is what the workers submitted,
+    /// `landed` comes from the NODE's account nonces (mined, not merely pooled),
+    /// and `pending` is the difference. A no-tip heartbeat therefore shows a full
+    /// submission cadence with a lower landed rate — which is the truth about the
+    /// auction, not a stalled cannon.
+    fn heartbeat_summary(&self) -> Option<HeartbeatSummary> {
+        let st = self.status.lock().ok()?;
+        heartbeat_summary_of(&st)
     }
 
     /// How many wallets are checked to fire.
@@ -1006,6 +1294,48 @@ impl CannonApp {
     /// not yet caused.
     fn destination_count(&self) -> usize {
         self.parse_dests().map(|d| d.len()).unwrap_or(0)
+    }
+}
+
+/// Aggregate the live heartbeat readout from an ALREADY-LOCKED status, so callers
+/// that hold the lock (the telemetry column) and callers that do not (the status
+/// strip) share one implementation and neither can deadlock on it.
+fn heartbeat_summary_of(st: &Status) -> Option<HeartbeatSummary> {
+    let hv = st.heartbeat?;
+    {
+        let elapsed = st.t0.elapsed().as_secs_f64();
+        let sent: u64 = st.wallets.iter().map(|w| w.sent).sum();
+        let spent: u128 = st.wallets.iter().map(|w| w.spent_grains).sum();
+        // Landed / pending are only known once every wallet has a baseline.
+        let landed = st
+            .wallets
+            .iter()
+            .map(|w| w.landed())
+            .try_fold(0u64, |acc, l| l.map(|l| acc + l));
+        let pending = st
+            .wallets
+            .iter()
+            .map(|w| w.pending())
+            .try_fold(0u64, |acc, p| p.map(|p| acc + p));
+        Some(HeartbeatSummary {
+            target_per_block: hv.target_per_block(),
+            actual_per_block: per_block_rate(sent, elapsed),
+            landed_per_block: landed.and_then(|l| per_block_rate(l, elapsed)),
+            sent,
+            landed,
+            pending,
+            spent_grains: spent,
+            elapsed_secs: st.t0.elapsed().as_secs(),
+            interval_ms: hv.interval_ms,
+            jitter_pct: hv.jitter_pct,
+            tip: hv.tip,
+            limits: hv.limits,
+            paused: st
+                .wallets
+                .iter()
+                .find_map(|w| w.waiting.clone())
+                .or_else(|| st.wallets.iter().find_map(|w| w.done_reason.clone())),
+        })
     }
 }
 
@@ -1132,6 +1462,14 @@ struct WorkerState {
     /// (network-bound signing). Refreshed on each node reconcile so a cannon
     /// running across the activation switches over automatically.
     domain: Option<sov_primitives::SigningDomain>,
+    /// The account nonce the NODE last reported: how far our txs have actually
+    /// MINED. The gap to `seq.peek()` is what is still pooled.
+    node_nonce: Option<u64>,
+    /// Transactions this worker has submitted (or dry-run built) this run.
+    sent: u64,
+    /// What those submissions committed: transfer + fee + tip, in grains. This is
+    /// the figure the heartbeat's spend cap is enforced against.
+    spent_grains: u128,
     /// Whether the node reports the `fee-auction` deployment Active — refreshed on
     /// each reconcile. Gates whether a bid becomes an `Action::Tipped` envelope or
     /// the bare action: a cannon spanning the activation starts tipping by itself,
@@ -1175,6 +1513,9 @@ fn run_worker(
         known_balance: None,
         height: 0,
         domain: None,
+        node_nonce: None,
+        sent: 0,
+        spent_grains: 0,
         auction_active: false,
     };
 
@@ -1184,6 +1525,17 @@ fn run_worker(
             run_continuous(&cfg, Some(Pacer::new(tps)), &mut ws, &status, &stop)
         }
         RateMode::Firehose => run_continuous(&cfg, None, &mut ws, &status, &stop),
+        RateMode::Heartbeat {
+            interval_ms,
+            jitter_pct,
+        } => run_heartbeat(
+            &cfg,
+            Heartbeat::new(interval_ms, jitter_pct),
+            &mut ws,
+            &status,
+            &stop,
+            &ctx,
+        ),
     }
 
     worker_finished(&status, &ctx, cfg.wallet_index, None);
@@ -1321,11 +1673,153 @@ fn run_continuous(
     }
 }
 
+/// Heartbeat mode: a gentle, INDEFINITE trickle that keeps the chain's blocks
+/// non-empty without ever behaving like a load test.
+///
+/// The loop is deliberately boring, because it has to survive weeks:
+///   * **pacing** — [`Heartbeat`] holds an ideal schedule, so latency and
+///     back-offs cannot make the cadence drift, and a stall is dropped rather
+///     than replayed as a burst. It paces SUBMISSIONS: if the operator chose "no
+///     tip" and the auction leaves those transactions waiting below the floor,
+///     the heartbeat keeps its submission cadence and the landed figure honestly
+///     reads lower — it never spirals trying to "catch up" landings.
+///   * **node hiccups** — an unreachable node is a back-off, never an exit; every
+///     recovery goes through [`sync_with_node`], which re-reads the nonce and
+///     reconciles forward, so a gap can never leave a stuck or reused nonce.
+///   * **safety rails** — before every send, [`heartbeat_halt`] decides whether
+///     the next transaction may go out. The balance floor PAUSES (it can free up
+///     again, and in closed-loop recycle it does); a session cap ENDS the run for
+///     this wallet, with the reason on screen.
+fn run_heartbeat(
+    cfg: &WorkerConfig,
+    mut hb: Heartbeat,
+    ws: &mut WorkerState,
+    status: &Arc<Mutex<Status>>,
+    stop: &Arc<AtomicBool>,
+    ctx: &eframe::egui::Context,
+) {
+    let started = Instant::now();
+    let mut last_sync: Option<Instant> = None;
+    let now_ms = |t: Instant| t.elapsed().as_millis() as u64;
+
+    while !stop.load(Ordering::SeqCst) {
+        // Reconcile on the usual cadence, and ALWAYS before a beat, so the nonce
+        // and balance behind a send are never older than one interval.
+        let due_sync = last_sync
+            .map(|t| t.elapsed() >= HEARTBEAT_SYNC_INTERVAL)
+            .unwrap_or(true);
+        if due_sync {
+            if !sync_with_node(cfg, ws, status) {
+                // Node down: hold the nonce, say so, keep trying. The schedule is
+                // untouched — a long outage is dropped, not replayed.
+                publish_wallet_stat(
+                    cfg,
+                    ws,
+                    status,
+                    Some(WalletNote::Waiting(
+                        "node not answering — holding the nonce, will resync and resume".into(),
+                    )),
+                );
+                ctx.request_repaint();
+                sleep_interruptible(stop, HEARTBEAT_RETRY_BACKOFF);
+                continue;
+            }
+            last_sync = Some(Instant::now());
+        }
+
+        if !hb.due(now_ms(started)) {
+            // Sleep to the next beat, but wake often enough to keep reconciling
+            // (and to make Stop feel instant — `sleep_interruptible` polls).
+            let wait = Duration::from_millis(hb.wait_ms(now_ms(started)));
+            // Never sleep past a reconcile, nor past one whole interval — a fast
+            // cadence stays responsive, a slow one still re-reads the node.
+            let cap = HEARTBEAT_SYNC_INTERVAL.min(Duration::from_millis(hb.interval_ms()));
+            sleep_interruptible(stop, wait.min(cap));
+            continue;
+        }
+
+        // What the next beat would commit, for the rails: the largest amount it
+        // could pick, plus the fee, plus the bid (only charged when the auction
+        // is live). Deliberately the WORST case, so a range amount can never slip
+        // under the reserve.
+        let next_cost = worst_case_cost(cfg, ws);
+        if let Some(halt) = heartbeat_halt(
+            &cfg.limits,
+            ws.known_balance,
+            ws.sent,
+            ws.spent_grains,
+            next_cost,
+        ) {
+            let msg = halt.message();
+            if halt.is_terminal() {
+                publish_wallet_stat(cfg, ws, status, Some(WalletNote::Done(msg)));
+                ctx.request_repaint();
+                return; // the session cap is the end of this wallet's run
+            }
+            // The balance floor: PAUSE. Re-read the balance each cycle so a
+            // top-up (or the recycled principal mining back in) resumes it.
+            publish_wallet_stat(cfg, ws, status, Some(WalletNote::Waiting(msg)));
+            ctx.request_repaint();
+            sleep_interruptible(stop, HEARTBEAT_PAUSE_BACKOFF);
+            last_sync = None; // force a fresh balance read before reconsidering
+            continue;
+        }
+
+        let before = ws.sent;
+        let outcome = fire_once(cfg, ws, status, /* commit_on_accept = */ true);
+        if ws.sent > before {
+            // A transaction actually went out: advance the schedule.
+            hb.on_submitted(now_ms(started), &mut ws.rng);
+        }
+        ctx.request_repaint();
+        if let FireResult::Backoff(d) = outcome {
+            // A rejection does NOT advance the schedule: the beat is still owed,
+            // so the cadence is held rather than skipped. But the other modes'
+            // back-offs are tuned for a firehose (200 ms); a heartbeat that keeps
+            // being refused must wait like a heartbeat, not spin — so the wait is
+            // at least one retry interval and never longer than one beat.
+            let wait = d
+                .max(HEARTBEAT_RETRY_BACKOFF)
+                .min(Duration::from_millis(hb.interval_ms()));
+            sleep_interruptible(stop, wait);
+            last_sync = None;
+        }
+    }
+}
+
+/// The most one beat could commit: the largest amount the configured mode can
+/// pick, the intrinsic fee, and the largest bid (charged only while the auction
+/// is live). The rails are checked against this worst case so a RANGE amount can
+/// never be the thing that crosses the operator's reserve.
+fn worst_case_cost(cfg: &WorkerConfig, ws: &WorkerState) -> u128 {
+    let amount = match cfg.amount_mode {
+        AmountMode::Fixed(v) => v,
+        AmountMode::Range { max, .. } => max,
+    };
+    let tip = if ws.auction_active {
+        match cfg.tip_mode {
+            TipMode::Off => 0,
+            TipMode::Fixed(v) => v,
+            TipMode::Range { max, .. } => max,
+        }
+    } else {
+        0
+    };
+    amount
+        .saturating_add(FEE_ESTIMATE_GRAINS)
+        .saturating_add(tip)
+}
+
 /// Refresh this wallet's nonce floor + balance from the node and publish them.
 /// Returns false if the node was unreachable (the caller idles and retries).
 fn sync_with_node(cfg: &WorkerConfig, ws: &mut WorkerState, status: &Arc<Mutex<Status>>) -> bool {
     match ws.client.nonce(&cfg.from) {
-        Ok(n) => ws.seq.reconcile(n),
+        Ok(n) => {
+            // The node's own account nonce IS the landed count: it only advances
+            // when one of our transactions is mined.
+            ws.node_nonce = Some(n);
+            ws.seq.reconcile(n)
+        }
         Err(e) => {
             set_error(status, &format!("RPC nonce failed: {e}"));
             return false;
@@ -1368,6 +1862,9 @@ fn fee_auction_active(client: &RpcClient) -> Option<bool> {
 enum WalletNote {
     /// Not firing right now, and why — self-clearing when firing resumes.
     Waiting(String),
+    /// This wallet's run ended for a NORMAL, operator-configured reason (a
+    /// heartbeat session cap). Not a fault, and rendered as one.
+    Done(String),
 }
 
 /// Publish this wallet's live stat row (next nonce, balance, condition) into the
@@ -1385,8 +1882,18 @@ fn publish_wallet_stat(
             wstat.first_nonce.get_or_insert(peek);
             wstat.next_nonce = peek;
             wstat.balance_grains = ws.known_balance;
+            wstat.sent = ws.sent;
+            wstat.spent_grains = ws.spent_grains;
+            if let Some(n) = ws.node_nonce {
+                wstat.first_node_nonce.get_or_insert(n);
+                wstat.node_nonce = Some(n);
+            }
             match note {
                 Some(WalletNote::Waiting(why)) => wstat.waiting = Some(why),
+                Some(WalletNote::Done(why)) => {
+                    wstat.waiting = None;
+                    wstat.done_reason = Some(why);
+                }
                 // Firing normally again: clear any stale wait reason.
                 None => wstat.waiting = None,
             }
@@ -1442,8 +1949,8 @@ fn fire_once(
             if ws.known_balance.is_some_and(|b| b < reserve) {
                 let detail = format!(
                     "balance {} XUS can't cover {} XUS + fee — waiting for pending txs to mine",
-                    grains_to_xus(ws.known_balance.unwrap_or(0)),
-                    grains_to_xus(amount)
+                    fmt_xus(ws.known_balance.unwrap_or(0)),
+                    fmt_xus(amount)
                 );
                 record(status, MeterKind::RejAfford);
                 publish_wallet_stat(cfg, ws, status, Some(WalletNote::Waiting(detail)));
@@ -1578,15 +2085,19 @@ fn fire_once(
     }
 }
 
-/// Debit the local balance view by amount + estimated fee + tip (pre-check only).
+/// Account for one transaction that went out: debit the local balance view by
+/// amount + estimated fee + tip (the affordability pre-check), and add the same
+/// cost to this run's spend — the figure the heartbeat's spend cap and the
+/// "spent so far" readout are both taken from.
 fn debit(ws: &mut WorkerState, amount: u128, tip: u128) {
+    let cost = amount
+        .saturating_add(FEE_ESTIMATE_GRAINS)
+        .saturating_add(tip);
     if let Some(b) = ws.known_balance.as_mut() {
-        *b = b.saturating_sub(
-            amount
-                .saturating_add(FEE_ESTIMATE_GRAINS)
-                .saturating_add(tip),
-        );
+        *b = b.saturating_sub(cost);
     }
+    ws.sent = ws.sent.saturating_add(1);
+    ws.spent_grains = ws.spent_grains.saturating_add(cost);
 }
 
 fn short_hash(h: &str) -> String {
@@ -1716,7 +2227,10 @@ fn stat_tile(ui: &mut Ui, t: &Tile) {
                 ui.label(RichText::new(t.glyph).small().monospace().color(t.accent));
                 eyebrow(ui, t.label);
             });
-            ui.horizontal(|ui| {
+            // The unit sits on the FIGURE's baseline, not centred against it, so
+            // the four tiles' numbers and units share one line across the band.
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::BOTTOM), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
                 ui.label(
                     RichText::new(&t.value)
                         .monospace()
@@ -2024,6 +2538,176 @@ fn draw_scope(
     );
 }
 
+/// The heartbeat readout: target cadence against measured cadence, what has been
+/// submitted vs actually mined, what it has cost, and — when it is not sending —
+/// why. Only drawn while a heartbeat run is live.
+///
+/// Submitted and landed are shown SEPARATELY on purpose. With the fee auction
+/// active, an untipped heartbeat can sit below the dynamic floor: submissions keep
+/// their cadence while landings lag, and that reads here as exactly what it is
+/// rather than as a broken cannon.
+fn draw_heartbeat_card(ui: &mut Ui, hb: &HeartbeatSummary) {
+    card_frame()
+        .stroke(Stroke::new(1.0, palette::VIOLET.gamma_multiply(0.55)))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width() - 4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("♥").monospace().color(palette::VIOLET));
+                eyebrow(ui, "heartbeat");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(fmt_elapsed(hb.elapsed_secs))
+                            .monospace()
+                            .small()
+                            .color(palette::DIM),
+                    );
+                    ui.label(
+                        RichText::new(match hb.tip {
+                            TipChoice::Auto => "auto tip",
+                            TipChoice::Manual => "manual tip",
+                            TipChoice::NoTip => "no tip",
+                        })
+                        .small()
+                        .monospace()
+                        .color(match hb.tip {
+                            TipChoice::Auto => palette::GREEN,
+                            TipChoice::Manual => palette::CYAN,
+                            TipChoice::NoTip => palette::AMBER,
+                        }),
+                    )
+                    .on_hover_text(match hb.tip {
+                        TipChoice::Auto => "bidding the suggested tip in the blockspace auction",
+                        TipChoice::Manual => "bidding the tip configured in section 3",
+                        TipChoice::NoTip => {
+                            "no bid: the auction is not being exercised, so these transactions can \
+                             wait below the fee floor"
+                        }
+                    });
+                });
+            });
+            ui.add_space(6.0);
+
+            // Cadence: target, submitted, landed — one row, one column width, all
+            // monospace so the three figures line up under each other.
+            let cadence = |ui: &mut Ui, label: &str, value: String, color: Color32, hint: &str| {
+                ui.horizontal(|ui| {
+                    ui.allocate_ui(Vec2::new(96.0, 0.0), |ui| {
+                        ui.label(RichText::new(label).small().color(palette::DIM));
+                    });
+                    ui.label(RichText::new(value).monospace().size(15.0).color(color));
+                    ui.label(RichText::new("tx/block").small().color(palette::FAINT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(hint).small().color(palette::FAINT));
+                    });
+                });
+            };
+            cadence(
+                ui,
+                "target",
+                format!("{:.2}", hb.target_per_block),
+                palette::VIOLET,
+                &format!(
+                    "one every {}{}",
+                    fmt_secs(hb.interval_ms as f64 / 1_000.0),
+                    if hb.jitter_pct > 0 {
+                        format!(" ±{}%", hb.jitter_pct)
+                    } else {
+                        " exactly".to_string()
+                    }
+                ),
+            );
+            cadence(
+                ui,
+                "submitted",
+                hb.actual_per_block
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| "—".into()),
+                palette::CYAN,
+                &format!("{} sent this run", fmt_count(hb.sent)),
+            );
+            cadence(
+                ui,
+                "landed",
+                hb.landed_per_block
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| "—".into()),
+                palette::GREEN,
+                &match (hb.landed, hb.pending) {
+                    (Some(l), Some(p)) => {
+                        format!("{} mined · {} in the pool", fmt_count(l), fmt_count(p))
+                    }
+                    (Some(l), None) => format!("{} mined", fmt_count(l)),
+                    _ => "waiting for the node's first nonce read".to_string(),
+                },
+            );
+
+            ui.add_space(4.0);
+            // Cost and rails, in one honest line.
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("{} XUS spent", fmt_xus(hb.spent_grains)))
+                        .monospace()
+                        .small()
+                        .color(palette::TEXT),
+                );
+                ui.label(RichText::new("·").small().color(palette::FAINT));
+                ui.label(
+                    RichText::new(format!("floor {} XUS", fmt_xus(hb.limits.reserve_grains)))
+                        .monospace()
+                        .small()
+                        .color(palette::DIM),
+                )
+                .on_hover_text("the heartbeat pauses rather than taking a wallet below this");
+                if let Some(max) = hb.limits.max_tx {
+                    ui.label(RichText::new("·").small().color(palette::FAINT));
+                    ui.label(
+                        RichText::new(format!("cap {} tx", fmt_count(max)))
+                            .monospace()
+                            .small()
+                            .color(palette::DIM),
+                    );
+                }
+                if let Some(max) = hb.limits.max_spend_grains {
+                    ui.label(RichText::new("·").small().color(palette::FAINT));
+                    ui.label(
+                        RichText::new(format!("cap {} XUS", fmt_xus(max)))
+                            .monospace()
+                            .small()
+                            .color(palette::DIM),
+                    );
+                }
+                if hb.limits.max_tx.is_none() && hb.limits.max_spend_grains.is_none() {
+                    ui.label(RichText::new("·").small().color(palette::FAINT));
+                    ui.label(
+                        RichText::new("no session cap")
+                            .small()
+                            .color(palette::FAINT),
+                    );
+                }
+            });
+
+            // Why it is not sending, when it is not. Never a silent stall.
+            if let Some(why) = &hb.paused {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("⏸  {why}"))
+                        .small()
+                        .color(palette::AMBER),
+                );
+            } else if hb.tip == TipChoice::NoTip {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "no tip: transactions may wait below the fee floor — a lower landed rate \
+                         here is the auction working, not a fault",
+                    )
+                    .small()
+                    .color(palette::FAINT),
+                );
+            }
+        });
+}
+
 /// One row of the outcome breakdown: a labelled proportional bar.
 #[allow(clippy::too_many_arguments)]
 fn outcome_row(
@@ -2079,6 +2763,11 @@ enum OpState {
     Ready,
     /// Workers are firing.
     Firing,
+    /// A heartbeat is running: the indefinite trickle, beating.
+    Beating,
+    /// Every worker is parked on a safety rail (the balance floor) — running, but
+    /// deliberately not sending. Distinct from both firing and an error.
+    Paused,
     /// Stop pressed; workers are finishing their in-flight submits.
     Draining,
     /// A run finished and its results are on screen.
@@ -2091,6 +2780,8 @@ impl OpState {
             OpState::Setup => "◇",
             OpState::Ready => "◆",
             OpState::Firing => "▶",
+            OpState::Beating => "♥",
+            OpState::Paused => "⏸",
             OpState::Draining => "◐",
             OpState::Stopped => "■",
         }
@@ -2100,18 +2791,28 @@ impl OpState {
             OpState::Setup => "SETUP",
             OpState::Ready => "READY",
             OpState::Firing => "FIRING",
+            OpState::Beating => "HEARTBEAT",
+            OpState::Paused => "PAUSED",
             OpState::Draining => "STOPPING",
             OpState::Stopped => "STOPPED",
         }
     }
+    /// Each state gets its OWN hue: nothing that means "waiting" or "wrong" ever
+    /// borrows the success green, and nothing running borrows the idle grey.
     fn color(self) -> Color32 {
         match self {
             OpState::Setup => palette::DIM,
             OpState::Ready => palette::CYAN,
             OpState::Firing => palette::GREEN,
+            OpState::Beating => palette::VIOLET,
+            OpState::Paused => palette::AMBER,
             OpState::Draining => palette::AMBER,
             OpState::Stopped => palette::DIM,
         }
+    }
+    /// Whether workers are alive in this state (firing, beating or parked).
+    fn is_live(self) -> bool {
+        matches!(self, OpState::Firing | OpState::Beating | OpState::Paused)
     }
 }
 
@@ -2218,13 +2919,36 @@ impl eframe::App for CannonApp {
                 self.destination_count(),
             )
         };
+        // A live run is FIRING, or BEATING when it is a heartbeat, or PAUSED when
+        // every live worker is parked on a rail rather than sending.
+        let (heartbeat, all_parked) = match self.status.lock() {
+            Ok(st) => (
+                st.heartbeat,
+                !st.wallets.is_empty()
+                    && st
+                        .wallets
+                        .iter()
+                        .all(|w| w.ended || w.waiting.is_some() || w.fault.is_some()),
+            ),
+            Err(_) => (None, false),
+        };
+        // A form field that will not parse is a REASON the cannon cannot fire, so
+        // it disables Start and explains itself there, rather than being discovered
+        // on click.
+        let arming = if running { None } else { self.arming_error() };
         let state = if running {
-            OpState::Firing
+            if all_parked {
+                OpState::Paused
+            } else if heartbeat.is_some() {
+                OpState::Beating
+            } else {
+                OpState::Firing
+            }
         } else if draining {
             OpState::Draining
         } else if self.last_run.is_some() {
             OpState::Stopped
-        } else if blocker.is_some() {
+        } else if blocker.is_some() || arming.is_some() {
             OpState::Setup
         } else {
             OpState::Ready
@@ -2239,7 +2963,7 @@ impl eframe::App for CannonApp {
         });
 
         self.top_bar(ctx, &conn, state, running);
-        self.control_bar(ctx, &conn, running, draining, blocker);
+        self.control_bar(ctx, &conn, running, draining, blocker, arming.clone());
 
         let wide = ctx.screen_rect().width() >= WIDE_LAYOUT_MIN;
         if wide {
@@ -2402,7 +3126,7 @@ impl CannonApp {
                                     .strong()
                                     .color(state.color()),
                             );
-                            if !self.dry_run && matches!(state, OpState::Firing | OpState::Ready) {
+                            if !self.dry_run && (state.is_live() || state == OpState::Ready) {
                                 ui.label(
                                     RichText::new("⚠ LIVE FIRE")
                                         .monospace()
@@ -2451,6 +3175,7 @@ impl CannonApp {
                 self.destination_count(),
             )
             .map(|b| b.message().to_string())
+            .or_else(|| self.arming_error())
             .unwrap_or_else(|| "finish configuring the run".into()),
             OpState::Ready => format!(
                 "{} — {} wallet(s) armed{}",
@@ -2479,6 +3204,39 @@ impl CannonApp {
                     if self.dry_run { " (dry-run)" } else { "" }
                 )
             }
+            OpState::Beating => {
+                let s = self.heartbeat_summary();
+                match s {
+                    Some(s) => format!(
+                        "target {:.2} tx/block · actual {} · {} sent, {} landed{}",
+                        s.target_per_block,
+                        s.actual_per_block
+                            .map(|a| format!("{a:.2} tx/block"))
+                            .unwrap_or_else(|| "measuring…".into()),
+                        fmt_count(s.sent),
+                        s.landed.map(fmt_count).unwrap_or_else(|| "—".to_string()),
+                        if s.pending.unwrap_or(0) > 0 {
+                            format!(
+                                " · {} waiting in the pool",
+                                fmt_count(s.pending.unwrap_or(0))
+                            )
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    None => "heartbeat running".into(),
+                }
+            }
+            OpState::Paused => self
+                .status
+                .lock()
+                .ok()
+                .and_then(|st| {
+                    st.wallets
+                        .iter()
+                        .find_map(|w| w.waiting.clone().or_else(|| w.fault.clone()))
+                })
+                .unwrap_or_else(|| "every wallet is parked — nothing is being submitted".into()),
             OpState::Draining => "workers are finishing their in-flight submits".into(),
             OpState::Stopped => match &self.last_run {
                 Some(r) => format!(
@@ -2503,6 +3261,7 @@ impl CannonApp {
         running: bool,
         draining: bool,
         blocker: Option<logic::Blocker>,
+        arming: Option<String>,
     ) {
         egui::TopBottomPanel::bottom("controls")
             .frame(
@@ -2527,7 +3286,7 @@ impl CannonApp {
                             self.stop();
                         }
                     } else {
-                        let armed = blocker.is_none();
+                        let armed = blocker.is_none() && arming.is_none();
                         let (label, fill) = if self.dry_run {
                             ("▶  START DRY-RUN", palette::CYAN)
                         } else {
@@ -2549,8 +3308,12 @@ impl CannonApp {
                         if resp.clicked() {
                             self.start(ctx);
                         }
+                        // A disabled Start always says WHY, in the same words the
+                        // state strip uses.
                         if let Some(b) = blocker {
                             resp.on_hover_text(b.message());
+                        } else if let Some(why) = &arming {
+                            resp.on_hover_text(why.clone());
                         }
                     }
 
@@ -2560,20 +3323,49 @@ impl CannonApp {
                     // --- rate mode: a segmented control ----------------------
                     ui.add_enabled_ui(!running, |ui| {
                         ui.horizontal(|ui| {
-                            for (choice, label) in [
-                                (ModeChoice::PerBlock, "Per block"),
-                                (ModeChoice::TargetTps, "Target TX/s"),
-                                (ModeChoice::Firehose, "Firehose"),
+                            for (choice, label, tip) in [
+                                (
+                                    ModeChoice::PerBlock,
+                                    "Per block",
+                                    "Fire a fixed burst on every new tip, then idle.",
+                                ),
+                                (
+                                    ModeChoice::TargetTps,
+                                    "Target TX/s",
+                                    "Hold a steady aggregate transactions-per-second rate.",
+                                ),
+                                (
+                                    ModeChoice::Firehose,
+                                    "Firehose",
+                                    "Submit flat-out; the mempool's refusals are the only brake.",
+                                ),
+                                (
+                                    ModeChoice::Heartbeat,
+                                    "♥ Heartbeat",
+                                    "A gentle, indefinite trickle that keeps blocks non-empty. \
+                                     Runs until you stop it, with a balance floor and optional \
+                                     session caps. Not a load test.",
+                                ),
                             ] {
                                 let on = self.mode == choice;
+                                let accent = if choice == ModeChoice::Heartbeat {
+                                    palette::VIOLET
+                                } else {
+                                    palette::CYAN
+                                };
                                 let text = RichText::new(label)
                                     .monospace()
                                     .small()
                                     .color(if on { Color32::BLACK } else { palette::DIM });
                                 let btn = egui::Button::new(text)
-                                    .fill(if on { palette::CYAN } else { palette::SURFACE_HI })
-                                    .min_size(Vec2::new(0.0, 28.0));
-                                if ui.add(btn).clicked() {
+                                    .fill(if on { accent } else { palette::SURFACE_HI })
+                                    .min_size(Vec2::new(0.0, MODE_BTN_H));
+                                let resp = ui.add(btn).on_hover_text(if running {
+                                    "stop the run to change the rate mode"
+                                } else {
+                                    tip
+                                });
+                                if resp.clicked() {
                                     self.mode = choice;
                                 }
                             }
@@ -2612,6 +3404,50 @@ impl CannonApp {
                                         .color(palette::DIM),
                                 );
                             }
+                            ModeChoice::Heartbeat => {
+                                // Cadence in whichever human framing the operator
+                                // prefers; both describe the same interval.
+                                for (per_block, label) in
+                                    [(true, "tx / block"), (false, "every N s")]
+                                {
+                                    let on = self.hb_per_block == per_block;
+                                    let btn = egui::Button::new(
+                                        RichText::new(label).monospace().small().color(if on {
+                                            Color32::BLACK
+                                        } else {
+                                            palette::DIM
+                                        }),
+                                    )
+                                    .fill(if on {
+                                        palette::VIOLET.gamma_multiply(0.85)
+                                    } else {
+                                        palette::SURFACE_HI
+                                    })
+                                    .min_size(Vec2::new(0.0, MODE_BTN_H));
+                                    if ui.add(btn).clicked() {
+                                        self.hb_per_block = per_block;
+                                    }
+                                }
+                                let field = if self.hb_per_block {
+                                    &mut self.hb_tx_per_block
+                                } else {
+                                    &mut self.hb_every_secs
+                                };
+                                ui.add(
+                                    egui::TextEdit::singleline(field)
+                                        .desired_width(56.0)
+                                        .font(egui::TextStyle::Monospace),
+                                );
+                                // The cadence, resolved — or exactly why it is not
+                                // usable, in the same place.
+                                let (text, color) = match self.parse_cadence().and_then(|c| {
+                                    c.interval_ms().map(|_| c.describe())
+                                }) {
+                                    Ok(d) => (d, palette::DIM),
+                                    Err(e) => (e, palette::RED),
+                                };
+                                ui.label(RichText::new(text).small().color(color));
+                            }
                         }
                     });
 
@@ -2623,9 +3459,21 @@ impl CannonApp {
                     // right-to-left sub-layout eats the whole remaining row and
                     // overlaps the mode controls once the window is narrow.
                     ui.add_enabled_ui(!running, |ui| {
-                        for (dry, label, color) in [
-                            (true, "DRY RUN", palette::CYAN),
-                            (false, "LIVE FIRE", palette::RED),
+                        for (dry, label, color, tip) in [
+                            (
+                                true,
+                                "DRY RUN",
+                                palette::CYAN,
+                                "Builds and signs every transaction but submits nothing — a full \
+                                 rehearsal, no fees, no chain effect.",
+                            ),
+                            (
+                                false,
+                                "LIVE FIRE",
+                                palette::RED,
+                                "Submits real signed transactions to this node and spends real \
+                                 fees.",
+                            ),
                         ] {
                             let on = self.dry_run == dry;
                             let btn = egui::Button::new(
@@ -2636,8 +3484,13 @@ impl CannonApp {
                                     .color(if on { Color32::BLACK } else { palette::DIM }),
                             )
                             .fill(if on { color } else { palette::SURFACE_HI })
-                            .min_size(Vec2::new(0.0, 28.0));
-                            if ui.add(btn).clicked() {
+                            .min_size(Vec2::new(0.0, MODE_BTN_H));
+                            let resp = ui.add(btn).on_hover_text(if running {
+                                "stop the run to change arming"
+                            } else {
+                                tip
+                            });
+                            if resp.clicked() {
                                 self.dry_run = dry;
                             }
                         }
@@ -2656,6 +3509,10 @@ impl CannonApp {
                     ModeChoice::Firehose =>
                         "No pacing: signs and submits flat-out until the mempool refuses, then holds the same nonce, \
                          backs off and retries. Mempool-full rejections ARE the throttle — expect them.",
+                    ModeChoice::Heartbeat =>
+                        "Runs INDEFINITELY at the cadence above, self-pacing against an ideal schedule so it neither \
+                         drifts nor bunches, jittered so it is not a metronome. Node hiccups are backed off and \
+                         resynced, never fatal. It pauses at the balance floor and stops at any session cap you set.",
                 };
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(consequence).small().color(palette::FAINT));
@@ -2814,9 +3671,7 @@ impl CannonApp {
                                 |ui| {
                                     // A balance we could not read is a dash, never 0.
                                     let (text, color) = match w.balance_grains {
-                                        Some(g) => {
-                                            (format!("{} XUS", grains_to_xus(g)), palette::TEXT)
-                                        }
+                                        Some(g) => (format!("{} XUS", fmt_xus(g)), palette::TEXT),
                                         None => ("— XUS".to_string(), palette::FAINT),
                                     };
                                     ui.label(RichText::new(text).monospace().small().color(color));
@@ -3016,6 +3871,249 @@ impl CannonApp {
             });
         });
         ui.add_space(8.0);
+
+        // 4. Heartbeat — only when that mode is selected, so the column stays as
+        //    short as the run it describes.
+        if self.mode == ModeChoice::Heartbeat {
+            self.heartbeat_card(ui, running);
+            ui.add_space(8.0);
+        }
+    }
+
+    /// The heartbeat's own settings: whether it exercises the fee auction, and the
+    /// rails that keep an indefinite run safe. The CADENCE lives in the control
+    /// bar with the other modes' parameters, so the one thing an operator tunes
+    /// mid-session is always on screen.
+    fn heartbeat_card(&mut self, ui: &mut Ui, running: bool) {
+        let auction = self.conn.lock().ok().and_then(|c| c.auction_active);
+        card_frame()
+            .stroke(Stroke::new(1.0, palette::VIOLET.gamma_multiply(0.45)))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 4.0);
+                eyebrow(ui, "4 · heartbeat");
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(match self.parse_cadence() {
+                        Ok(c) => c.describe(),
+                        Err(e) => e,
+                    })
+                    .monospace()
+                    .color(palette::VIOLET),
+                );
+                ui.label(
+                    RichText::new("Runs until you stop it. Set the cadence in the control bar.")
+                        .small()
+                        .color(palette::FAINT),
+                );
+
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut self.hb_jitter,
+                        RichText::new("Jitter the interval (organic, not a metronome)").small(),
+                    )
+                    .on_hover_text(
+                        "Spreads each beat ±20% around its scheduled instant. The MEAN cadence is \
+                         unchanged — only the texture of the stream.",
+                    );
+
+                    // --- does this heartbeat exercise the fee auction? ----------
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Blockspace fee auction")
+                            .small()
+                            .color(palette::DIM),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for choice in [TipChoice::Auto, TipChoice::Manual, TipChoice::NoTip] {
+                            let on = self.hb_tip == choice;
+                            let accent = match choice {
+                                TipChoice::Auto => palette::GREEN,
+                                TipChoice::Manual => palette::CYAN,
+                                TipChoice::NoTip => palette::AMBER,
+                            };
+                            let btn = egui::Button::new(
+                                RichText::new(choice.label())
+                                    .monospace()
+                                    .small()
+                                    .color(if on { Color32::BLACK } else { palette::DIM }),
+                            )
+                            .fill(if on { accent } else { palette::SURFACE_HI })
+                            .min_size(Vec2::new(0.0, MODE_BTN_H));
+                            if ui.add(btn).on_hover_text(choice.consequence()).clicked() {
+                                self.hb_tip = choice;
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new(self.hb_tip.consequence())
+                            .small()
+                            .color(palette::FAINT),
+                    );
+                    match self.hb_tip {
+                        TipChoice::Auto => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "bid {} XUS per transaction",
+                                    fmt_xus(SUGGESTED_TIP_GRAINS)
+                                ))
+                                .monospace()
+                                .small()
+                                .color(palette::DIM),
+                            );
+                        }
+                        TipChoice::Manual => {
+                            ui.label(
+                                RichText::new(match self.parse_tip_fields() {
+                                    Ok(TipMode::Fixed(v)) => {
+                                        format!("bid {} XUS per transaction", fmt_xus(v))
+                                    }
+                                    Ok(TipMode::Range { min, max }) => format!(
+                                        "bid {}–{} XUS per transaction",
+                                        fmt_xus(min),
+                                        fmt_xus(max)
+                                    ),
+                                    Ok(TipMode::Off) => "no bid".to_string(),
+                                    Err(e) => format!("✖ {e}"),
+                                })
+                                .monospace()
+                                .small()
+                                .color(palette::DIM),
+                            )
+                            .on_hover_text("Set the fixed value or range in section 3 · traffic.");
+                        }
+                        TipChoice::NoTip => {}
+                    }
+                    // The honest note about what the NODE will do with the bid.
+                    let (hint, color) = match (auction, self.hb_tip) {
+                        (Some(true), TipChoice::NoTip) => (
+                            "fee-auction is ACTIVE and this heartbeat bids nothing: its transactions \
+                             wait behind every funded bid. Watch submitted vs landed below — waiting \
+                             is the auction working, not a fault."
+                                .to_string(),
+                            palette::AMBER,
+                        ),
+                        (Some(true), _) => (
+                            "fee-auction is ACTIVE — the bid is attached and competes for inclusion."
+                                .to_string(),
+                            palette::GREEN,
+                        ),
+                        (Some(false), _) => (
+                            "fee-auction is DORMANT on this node — no bid is attached whatever you \
+                             choose here; transactions stay byte-identical to untipped ones."
+                                .to_string(),
+                            palette::AMBER,
+                        ),
+                        (None, _) => (
+                            "fee-auction state unknown (the node has not answered \
+                             sov_getDeployments yet)."
+                                .to_string(),
+                            palette::FAINT,
+                        ),
+                    };
+                    ui.label(RichText::new(hint).small().color(color));
+
+                    // --- the rails ---------------------------------------------
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Safety rails")
+                            .small()
+                            .color(palette::DIM),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("keep at least")
+                                .small()
+                                .color(palette::DIM),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.hb_reserve)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(74.0),
+                        );
+                        ui.label(RichText::new("XUS").small().color(palette::FAINT));
+                    })
+                    .response
+                    .on_hover_text(
+                        "The balance floor. The heartbeat PAUSES rather than taking a wallet below \
+                         this, and resumes by itself if the balance recovers. It never drains a \
+                         wallet.",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.hb_cap_tx_on, RichText::new("stop after").small());
+                        ui.add_enabled(
+                            self.hb_cap_tx_on,
+                            egui::TextEdit::singleline(&mut self.hb_cap_tx)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(74.0),
+                        );
+                        ui.label(RichText::new("tx").small().color(palette::FAINT));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.hb_cap_spend_on,
+                            RichText::new("stop after").small(),
+                        );
+                        ui.add_enabled(
+                            self.hb_cap_spend_on,
+                            egui::TextEdit::singleline(&mut self.hb_cap_spend)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(74.0),
+                        );
+                        ui.label(RichText::new("XUS spent").small().color(palette::FAINT));
+                    });
+                    if !self.hb_cap_tx_on && !self.hb_cap_spend_on {
+                        ui.label(
+                            RichText::new(
+                                "No session cap: only the balance floor stops this run. Both caps \
+                                 are aggregate and split across the firing wallets.",
+                            )
+                            .small()
+                            .color(palette::FAINT),
+                        );
+                    }
+                    if let Err(e) = self.parse_limits() {
+                        ui.label(RichText::new(format!("✖ {e}")).small().color(palette::RED));
+                    }
+                    // What an indefinite run actually costs, from the numbers on
+                    // screen — never a guess.
+                    if let Ok(interval) = self.parse_cadence().and_then(|c| c.interval_ms()) {
+                        let per_day = 86_400_000f64 / interval as f64;
+                        let cost = self.per_tx_cost_estimate();
+                        ui.label(
+                            RichText::new(format!(
+                                "≈ {} tx/day · up to {} XUS/day at the current amount, fee and bid",
+                                fmt_count(per_day.round() as u64),
+                                fmt_xus((cost as f64 * per_day) as u128)
+                            ))
+                            .small()
+                            .monospace()
+                            .color(palette::DIM),
+                        );
+                    }
+                });
+            });
+    }
+
+    /// The worst-case cost of one heartbeat transaction from the current form:
+    /// the largest amount it can pick, the intrinsic fee, and the largest bid.
+    /// Used only for the "per day" estimate, so an unparseable field reads as the
+    /// fee alone rather than as a panic.
+    fn per_tx_cost_estimate(&self) -> u128 {
+        let amount = match self.parse_amount_mode() {
+            Ok(AmountMode::Fixed(v)) => v,
+            Ok(AmountMode::Range { max, .. }) => max,
+            Err(_) => 0,
+        };
+        let tip = match self.effective_tip_mode() {
+            Ok(TipMode::Off) => 0,
+            Ok(TipMode::Fixed(v)) => v,
+            Ok(TipMode::Range { max, .. }) => max,
+            Err(_) => 0,
+        };
+        amount
+            .saturating_add(FEE_ESTIMATE_GRAINS)
+            .saturating_add(tip)
     }
 
     // ---- centre: telemetry ----------------------------------------------
@@ -3032,6 +4130,7 @@ impl CannonApp {
             }
         };
         let now = st.now_ms();
+        let heartbeat = heartbeat_summary_of(&st);
         let ever_ran = self.last_run.is_some() || st.running;
         let r = |k: MeterKind| {
             if ever_ran {
@@ -3132,6 +4231,14 @@ impl CannonApp {
             }
         }
         ui.add_space(8.0);
+
+        // --- 1b. the heartbeat readout (only while one is running) -------
+        // Drawn directly under the headline band and above the scope: while a
+        // heartbeat is running, cadence is the thing the operator watches.
+        if let Some(hb) = &heartbeat {
+            draw_heartbeat_card(ui, hb);
+            ui.add_space(8.0);
+        }
 
         // --- 2. the scope -----------------------------------------------
         {
@@ -3249,12 +4356,24 @@ impl CannonApp {
                 eyebrow(ui, "wallets in this run");
                 ui.add_space(4.0);
                 egui::Grid::new("wallet-stats")
-                    .num_columns(5)
+                    .num_columns(7)
                     .striped(true)
                     .spacing(Vec2::new(14.0, 4.0))
                     .show(ui, |ui| {
-                        for h in ["wallet", "next nonce", "committed", "balance", "state"] {
-                            ui.label(RichText::new(h).small().color(palette::FAINT));
+                        // Every heading names a real counter; "landed" and "pooled"
+                        // come from the node's own account nonce, so submitted and
+                        // mined are never conflated.
+                        for (h, hint) in [
+                            ("wallet", "the keystore label this worker fires from"),
+                            ("next nonce", "the nonce this worker will submit at"),
+                            ("submitted", "transactions this worker has sent this run"),
+                            ("landed", "of those, how many the chain has MINED"),
+                            ("pooled", "submitted but not yet mined"),
+                            ("balance", "the node's view of this wallet's balance"),
+                            ("state", "what this worker is doing right now"),
+                        ] {
+                            ui.label(RichText::new(h).small().color(palette::FAINT))
+                                .on_hover_text(hint);
                         }
                         ui.end_row();
                         for w in &st.wallets {
@@ -3266,10 +4385,19 @@ impl CannonApp {
                                     .color(palette::DIM),
                             );
                             ui.label(
+                                RichText::new(fmt_count(w.sent))
+                                    .monospace()
+                                    .small()
+                                    .color(palette::CYAN),
+                            )
+                            .on_hover_text(match w.committed() {
+                                Some(c) => format!("{} nonces committed this run", fmt_count(c)),
+                                None => "nonce baseline not yet read from the node".to_string(),
+                            });
+                            // A figure we have not read is a dash, never a zero.
+                            ui.label(
                                 RichText::new(
-                                    w.committed()
-                                        .map(fmt_count)
-                                        .unwrap_or_else(|| "—".to_string()),
+                                    w.landed().map(fmt_count).unwrap_or_else(|| "—".to_string()),
                                 )
                                 .monospace()
                                 .small()
@@ -3277,54 +4405,118 @@ impl CannonApp {
                             );
                             ui.label(
                                 RichText::new(
+                                    w.pending()
+                                        .map(fmt_count)
+                                        .unwrap_or_else(|| "—".to_string()),
+                                )
+                                .monospace()
+                                .small()
+                                .color(palette::AMBER),
+                            );
+                            ui.label(
+                                RichText::new(
                                     w.balance_grains
-                                        .map(|g| format!("{} XUS", grains_to_xus(g)))
+                                        .map(|g| format!("{} XUS", fmt_xus(g)))
                                         .unwrap_or_else(|| "—".into()),
                                 )
                                 .monospace()
                                 .small(),
                             );
+                            // Each condition gets its own glyph, word AND hue: a
+                            // fault never looks like a pause, and a configured stop
+                            // never looks like a fault.
                             let (glyph, text, color) = match (&w.fault, w.ended, &w.waiting) {
                                 (Some(why), _, _) => ("✖", format!("failed — {why}"), palette::RED),
-                                (None, true, _) => ("■", "finished".to_string(), palette::DIM),
+                                (None, true, _) => match &w.done_reason {
+                                    Some(why) => ("■", format!("stopped — {why}"), palette::CYAN),
+                                    None => ("■", "finished".to_string(), palette::DIM),
+                                },
                                 (None, false, Some(why)) => {
-                                    ("⏳", format!("waiting — {why}"), palette::AMBER)
+                                    ("⏸", format!("paused — {why}"), palette::AMBER)
+                                }
+                                (None, false, None) if st.running && heartbeat.is_some() => {
+                                    ("♥", "beating".to_string(), palette::VIOLET)
                                 }
                                 (None, false, None) if st.running => {
                                     ("▶", "firing".to_string(), palette::GREEN)
                                 }
                                 _ => ("·", "idle".to_string(), palette::FAINT),
                             };
-                            ui.label(
-                                RichText::new(format!("{glyph} {text}"))
-                                    .small()
-                                    .color(color),
-                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("{glyph} {text}"))
+                                        .small()
+                                        .color(color),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(text);
                             ui.end_row();
                         }
                     });
             });
             ui.add_space(8.0);
-        } else if state == OpState::Setup {
+        } else if matches!(state, OpState::Setup | OpState::Ready) {
             // Nothing configured yet: an explicit three-step orientation rather
             // than a screen of zeroed meters.
+            let ready = state == OpState::Ready;
             card_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width() - 4.0);
-                eyebrow(ui, "getting started");
+                eyebrow(ui, if ready { "ready to fire" } else { "getting started" });
                 ui.add_space(4.0);
-                for (n, step) in [
-                    "Point at a node and unlock SOV-Station's keystore with your master passphrase.",
-                    "Check the wallets to fire from and choose where the XUS goes (recycle keeps it yours).",
-                    "Pick a rate mode, leave DRY RUN armed for a rehearsal, then start.",
-                ]
-                .iter()
-                .enumerate()
-                {
+                if ready {
+                    // Configured, nothing run yet: state what START will do, so the
+                    // panel is a briefing rather than an empty set of meters.
                     ui.label(
-                        RichText::new(format!("{}.  {step}", n + 1))
-                            .small()
-                            .color(palette::DIM),
+                        RichText::new(self.mode_summary())
+                            .monospace()
+                            .color(if self.dry_run {
+                                palette::CYAN
+                            } else {
+                                palette::RED
+                            }),
                     );
+                    ui.label(
+                        RichText::new(format!(
+                            "{} wallet(s) armed · {} · {}",
+                            self.selected_count(),
+                            if self.recycle {
+                                "closed loop to your own wallets"
+                            } else {
+                                "sending to the destinations you listed"
+                            },
+                            if self.dry_run {
+                                "DRY RUN — nothing will be submitted"
+                            } else {
+                                "LIVE FIRE — real transactions, real fees"
+                            }
+                        ))
+                        .small()
+                        .color(palette::DIM),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(
+                            "The meters below stay empty until a run starts — they show measured                              counters only, never a placeholder zero.",
+                        )
+                        .small()
+                        .color(palette::FAINT),
+                    );
+                } else {
+                    for (n, step) in [
+                        "Point at a node and unlock SOV-Station's keystore with your master passphrase.",
+                        "Check the wallets to fire from and choose where the XUS goes (recycle keeps it yours).",
+                        "Pick a rate mode — or ♥ Heartbeat for a constant gentle stream — leave DRY RUN armed for a rehearsal, then start.",
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        ui.label(
+                            RichText::new(format!("{}.  {step}", n + 1))
+                                .small()
+                                .color(palette::DIM),
+                        );
+                    }
                 }
             });
             ui.add_space(8.0);
@@ -3391,7 +4583,7 @@ impl CannonApp {
                                     line.nonce,
                                     truncate(&line.wallet, 10),
                                     truncate(&line.to, 10),
-                                    grains_to_xus(line.amount_grains),
+                                    fmt_xus(line.amount_grains),
                                     line.detail
                                 ))
                                 .monospace()
